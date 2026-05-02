@@ -94,6 +94,12 @@ def cmd_profile_public(args: argparse.Namespace) -> int:
     return handler(args)
 
 
+def cmd_run_public(args: argparse.Namespace) -> int:
+    from .commands.public import cmd_run_public as handler
+
+    return handler(args)
+
+
 def cmd_qa_public(args: argparse.Namespace) -> int:
     from .commands.public import cmd_qa_public as handler
 
@@ -140,8 +146,9 @@ def _cmd_inspect_model(args: argparse.Namespace) -> int:
 
     inspection = inspect_model(args.model)
     print(inspection.to_json())
-    if args.require_mtp and not inspection.passes_primary_gate:
-        return 2
+    compatibility = inspection.compatibility or {}
+    if args.require_mtp or getattr(args, "strict_exit_code", True):
+        return int(compatibility.get("exit_code", 0))
     return 0
 
 
@@ -865,13 +872,24 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     doctor_p.set_defaults(func=cmd_doctor)
 
-    inspect_public_p = sub.add_parser("inspect", help="Inspect MTPLX artifacts")
-    inspect_sub = inspect_public_p.add_subparsers(dest="inspect_action", required=True)
-    inspect_model_p = inspect_sub.add_parser("model", help="Inspect a model and auto-check MTP support")
-    inspect_model_p.add_argument("--model", required=True)
-    inspect_model_p.add_argument("--require-mtp", action="store_true")
-    inspect_model_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
-    inspect_model_p.set_defaults(func=cmd_inspect_model_public)
+    inspect_public_p = sub.add_parser("inspect", help="Inspect a model and auto-check MTP support")
+    inspect_public_p.add_argument(
+        "model_args",
+        nargs="*",
+        metavar="MODEL",
+        help="Model path/repo id. Legacy form 'inspect model MODEL' is also accepted.",
+    )
+    inspect_public_p.add_argument("--model")
+    inspect_public_p.add_argument("--require-mtp", action="store_true")
+    inspect_public_p.add_argument(
+        "--no-strict-exit-code",
+        action="store_false",
+        dest="strict_exit_code",
+        help="Always exit 0 after printing the compatibility verdict.",
+    )
+    inspect_public_p.set_defaults(strict_exit_code=True)
+    inspect_public_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    inspect_public_p.set_defaults(func=cmd_inspect_model_public)
 
     init_p = sub.add_parser("init", help="Initialize MTPLX user config without importing MLX")
     init_p.add_argument("--config", default="~/.mtplx/config.toml")
@@ -884,9 +902,30 @@ def build_parser() -> argparse.ArgumentParser:
     profiles_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     profiles_p.set_defaults(func=_cmd_profiles)
 
+    run_p = sub.add_parser("run", help="Run a one-shot verified MTPLX completion")
+    run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
+    run_p.add_argument("--model", default=default_model)
+    run_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    run_p.add_argument("--unsafe-force-unverified", action="store_true")
+    run_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
+    run_p.add_argument("--prompt", help="Prompt text, as an alternative to the positional prompt")
+    run_p.add_argument("--system", help="Optional system prompt")
+    run_p.add_argument("--max-tokens", type=int, default=192)
+    run_p.add_argument("--temperature", type=float, default=0.6)
+    run_p.add_argument("--top-p", type=float, default=0.95)
+    run_p.add_argument("--top-k", type=int, default=20)
+    run_p.add_argument("--depth", type=int, default=3)
+    run_p.add_argument("--seed", type=int, default=0)
+    run_p.add_argument("--quiet", action="store_true", help="Hide the stats footer")
+    run_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
+    run_p.add_argument("--expect-python", action="store_true")
+    run_p.set_defaults(func=cmd_run_public)
+
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
     chat_p.add_argument("--model", default=default_model)
     chat_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    chat_p.add_argument("--unsafe-force-unverified", action="store_true")
+    chat_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     chat_p.add_argument("--prompt", required=True)
     chat_p.add_argument("--max-tokens", type=int, default=192)
     chat_p.add_argument("--temperature", type=float, default=0.6)
@@ -900,6 +939,8 @@ def build_parser() -> argparse.ArgumentParser:
     serve_p = sub.add_parser("serve", help="Start the OpenAI-compatible MTPLX server")
     serve_p.add_argument("--model", default=default_model)
     serve_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
+    serve_p.add_argument("--unsafe-force-unverified", action="store_true")
+    serve_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     serve_p.add_argument("--host", default="127.0.0.1")
     serve_p.add_argument("--port", type=int, default=8000)
     serve_p.add_argument("--depth", type=int, default=3)
@@ -917,6 +958,13 @@ def build_parser() -> argparse.ArgumentParser:
     inspect_p = sub.add_parser("inspect-model", help="Inspect Qwen/MLX model artifacts")
     inspect_p.add_argument("model")
     inspect_p.add_argument("--require-mtp", action="store_true")
+    inspect_p.add_argument(
+        "--no-strict-exit-code",
+        action="store_false",
+        dest="strict_exit_code",
+        help="Always exit 0 after printing the compatibility verdict.",
+    )
+    inspect_p.set_defaults(strict_exit_code=True)
     inspect_p.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     inspect_p.set_defaults(func=_cmd_inspect_model)
 
@@ -959,6 +1007,8 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--strict-cold", action="store_true", help="Enforce cold 55 tok/s regression gate")
     bench_p.add_argument("--no-fanmax", action="store_true", help="Mark run as no-fan product candidate")
     bench_p.add_argument("--fanmax", action="store_true", help="Mark run as fan-controlled diagnostic")
+    bench_p.add_argument("--unsafe-force-unverified", action="store_true")
+    bench_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
     bench_p.add_argument("--dry-run", action="store_true")
     bench_p.add_argument(
         "--harness",

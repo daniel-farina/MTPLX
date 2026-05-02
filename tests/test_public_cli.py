@@ -197,11 +197,33 @@ def test_public_bench_parser_has_seed_for_live_child_runs():
 def test_chat_and_serve_default_to_stable_profile():
     parser = build_parser()
 
+    run_args = parser.parse_args(["run", "hello"])
     chat_args = parser.parse_args(["chat", "--prompt", "hello"])
     serve_args = parser.parse_args(["serve"])
 
+    assert run_args.profile == "stable"
+    assert run_args.prompt_arg == "hello"
     assert chat_args.profile == "stable"
     assert serve_args.profile == "stable"
+
+
+def test_inspect_accepts_direct_model_argument():
+    parser = build_parser()
+
+    args = parser.parse_args(["inspect", "models/example", "--json"])
+
+    assert args.command == "inspect"
+    assert args.model_args == ["models/example"]
+    assert args.strict_exit_code is True
+
+
+def test_inspect_accepts_legacy_model_subword_form():
+    parser = build_parser()
+
+    args = parser.parse_args(["inspect", "model", "models/example", "--json"])
+
+    assert args.command == "inspect"
+    assert args.model_args == ["model", "models/example"]
 
 
 def test_profiles_command_lists_default_without_mlx(capsys):

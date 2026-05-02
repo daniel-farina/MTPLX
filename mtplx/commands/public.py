@@ -39,6 +39,9 @@ from mtplx.kpi.runtime_kpis import (
     distribution_suite_names,
     repo_root,
 )
+from mtplx.backends.registry import (
+    TIER_ARCH_COMPATIBLE_UNVERIFIED,
+)
 from mtplx.profiles import DEFAULT_PROFILE_NAME, apply_profile_env, get_profile
 
 
@@ -87,11 +90,26 @@ def _bench_run_console_summary(envelope: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _model_gate(model: str) -> tuple[dict[str, Any], int | None]:
+def _model_gate(
+    model: str,
+    *,
+    unsafe_force_unverified: bool = False,
+    yes: bool = False,
+) -> tuple[dict[str, Any], int | None]:
     inspection = inspect_model(model).to_dict()
-    if not inspection.get("passes_primary_gate"):
-        return inspection, EXIT_UNSUPPORTED_MODEL
-    return inspection, None
+    compatibility = inspection.get("compatibility") or {}
+    tier = compatibility.get("tier")
+    exit_code = int(compatibility.get("exit_code", EXIT_UNSUPPORTED_MODEL))
+    if exit_code == 0 and compatibility.get("can_run"):
+        return inspection, None
+    if unsafe_force_unverified and yes and tier == TIER_ARCH_COMPATIBLE_UNVERIFIED:
+        print(
+            "WARNING: running an architecture-compatible but unverified MTPLX model; "
+            "exactness and performance are not guaranteed.",
+            file=sys.stderr,
+        )
+        return inspection, None
+    return inspection, exit_code
 
 
 def _exactness_profile_kwargs(args: Any) -> dict[str, Any]:
@@ -185,10 +203,20 @@ def cmd_doctor(args: Any) -> int:
 
 
 def cmd_inspect_model_public(args: Any) -> int:
-    inspection, gate_exit = _model_gate(args.model)
+    model_args = list(getattr(args, "model_args", []) or [])
+    if model_args and model_args[0] == "model":
+        model_args = model_args[1:]
+    model = args.model or getattr(args, "model_arg", None) or (model_args[0] if model_args else None)
+    if len(model_args) > 1:
+        raise SystemExit("inspect accepts exactly one model path/repo id")
+    if not model:
+        raise SystemExit("inspect requires MODEL or --model MODEL")
+    inspection = inspect_model(model).to_dict()
     _print(inspection)
-    if args.require_mtp and gate_exit is not None:
-        return gate_exit
+    compatibility = inspection.get("compatibility") or {}
+    exit_code = int(compatibility.get("exit_code", 0))
+    if args.require_mtp or getattr(args, "strict_exit_code", True):
+        return exit_code
     return 0
 
 
@@ -261,7 +289,11 @@ def _cmd_bench_run(args: Any) -> int:
             }
         )
         return 0
-    inspection, gate_exit = _model_gate(model)
+    inspection, gate_exit = _model_gate(
+        model,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=bool(getattr(args, "yes", False)),
+    )
     if gate_exit is not None:
         _print({"error": "model failed MTP primary gate", "model": inspection})
         return gate_exit
@@ -1473,6 +1505,14 @@ def cmd_thermal_public(args: Any) -> int:
 
 def cmd_serve_public(args: Any) -> int:
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    inspection, gate_exit = _model_gate(
+        args.model,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=bool(getattr(args, "yes", False)),
+    )
+    if gate_exit is not None:
+        _print({"error": "model failed MTPLX compatibility gate", "model": inspection})
+        return gate_exit
     cmd = [
         sys.executable,
         str(repo_root() / "scripts" / "serve_openai_mtplx.py"),
@@ -1501,21 +1541,40 @@ def cmd_serve_public(args: Any) -> int:
     return 0
 
 
-def cmd_chat_public(args: Any) -> int:
-    # Keep this intentionally simple: chat is a smoke path, not the benchmark path.
+def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str, Any], list[Any]]:
+    prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
+    if not prompt:
+        raise SystemExit(f"mtplx {command} requires a prompt")
+    inspection, gate_exit = _model_gate(
+        args.model,
+        unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
+        yes=bool(getattr(args, "yes", False)),
+    )
+    if gate_exit is not None:
+        return gate_exit, {"error": "model failed MTP primary gate", "model": inspection}, []
+    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
+    apply_profile_env(profile.name)
+
     from mtplx.benchmarks.schema import PromptCase, encode_prompt_case
     from mtplx.generation import generate_mtpk
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
-    inspection, gate_exit = _model_gate(args.model)
-    if gate_exit is not None:
-        _print({"error": "model failed MTP primary gate", "model": inspection})
-        return gate_exit
-    profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
-    apply_profile_env(profile.name)
     rt = load(args.model, mtp=True)
-    case = PromptCase(id="cli_chat", category="chat", prompt=args.prompt, max_tokens=args.max_tokens)
+    messages = None
+    system = getattr(args, "system", None)
+    if system:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+    case = PromptCase(
+        id=f"cli_{command}",
+        category=command,
+        prompt=prompt,
+        max_tokens=args.max_tokens,
+        messages=messages,
+    )
     prompt_ids = encode_prompt_case(rt.tokenizer, case, chat_template=True, enable_thinking=False)
     out = generate_mtpk(
         rt,
@@ -1536,20 +1595,47 @@ def cmd_chat_public(args: Any) -> int:
     ]
     if args.expect_python:
         validations.append(validate_python_syntax(out.text))
-    _print(
-        {
-            "text": out.text,
-            "profile": profile.to_dict(),
-            "stats": {
-                "generated_tokens": out.stats.generated_tokens,
-                "tok_s": out.stats.tok_s,
-                "verify_ms_per_call": (
-                    1000.0 * out.stats.verify_time_s / out.stats.verify_calls
-                    if out.stats.verify_calls
-                    else None
-                ),
-            },
-            "validations": [v.__dict__ for v in validations],
-        }
-    )
-    return 0 if all(v.passed for v in validations) else EXIT_QUALITY
+    payload = {
+        "text": out.text,
+        "model": inspection,
+        "profile": profile.to_dict(),
+        "stats": {
+            "generated_tokens": out.stats.generated_tokens,
+            "tok_s": out.stats.tok_s,
+            "verify_ms_per_call": (
+                1000.0 * out.stats.verify_time_s / out.stats.verify_calls
+                if out.stats.verify_calls
+                else None
+            ),
+        },
+        "validations": [v.__dict__ for v in validations],
+    }
+    return 0 if all(v.passed for v in validations) else EXIT_QUALITY, payload, validations
+
+
+def cmd_run_public(args: Any) -> int:
+    code, payload, _validations = _generate_one_shot_public(args, command="run")
+    if "error" in payload:
+        _print(payload)
+        return code
+    if getattr(args, "json", False):
+        _print(payload)
+    else:
+        text = payload["text"]
+        print(text, end="" if text.endswith("\n") else "\n")
+        if not getattr(args, "quiet", False):
+            stats = payload["stats"]
+            tok_s = stats.get("tok_s")
+            tok_s_text = f"{tok_s:.2f}" if isinstance(tok_s, (int, float)) else "n/a"
+            print(
+                f"\n[mtplx] profile={payload['profile']['name']} "
+                f"tokens={stats.get('generated_tokens')} tok_s={tok_s_text}"
+            )
+    return code
+
+
+def cmd_chat_public(args: Any) -> int:
+    # Still a one-shot smoke path until the interactive REPL lands in Phase 5.
+    code, payload, _validations = _generate_one_shot_public(args, command="chat")
+    _print(payload)
+    return code

@@ -32,7 +32,14 @@ printf '{"model_type":"llama"}\n' > "$MODEL_DIR/config.json"
 
 "$VENV/bin/mtplx" --help >/dev/null
 "$VENV/bin/mtplx" doctor --json >/dev/null
-"$VENV/bin/mtplx" inspect model --model "$MODEL_DIR" --json >/dev/null
+set +e
+"$VENV/bin/mtplx" inspect "$MODEL_DIR" --json >/dev/null
+INSPECT_STATUS=$?
+set -e
+if [ "$INSPECT_STATUS" -ne 2 ]; then
+  echo "expected no-MTP inspect to exit 2, got $INSPECT_STATUS" >&2
+  exit 1
+fi
 "$VENV/bin/mtplx" init --dry-run --json --config "$WORKDIR/config.toml" >/dev/null
 
 echo "fresh_venv_smoke: passed no-MLX CLI survival checks"

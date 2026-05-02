@@ -110,9 +110,12 @@ class ModelInspection:
     sidecars: dict[str, bool] = field(default_factory=dict)
     model_files: tuple[str, ...] = ()
     mtp: MTPInspection | None = None
+    compatibility: dict[str, Any] = field(default_factory=dict)
 
     @property
     def passes_primary_gate(self) -> bool:
+        if self.compatibility:
+            return self.compatibility.get("tier") == "verified"
         return (
             self.config_exists
             and (self.model_type or "").startswith("qwen3_5")
@@ -136,6 +139,13 @@ class ModelInspection:
             "model_files": list(self.model_files),
             "passes_primary_gate": self.passes_primary_gate,
             "mtp": self.mtp.to_dict() if self.mtp else None,
+            "compatibility": self.compatibility,
+            "mtp_supported": self.compatibility.get("mtp_supported"),
+            "mtp_arch": self.compatibility.get("arch_id"),
+            "recommended_backend": self.compatibility.get("recommended_backend"),
+            "recommended_profile": self.compatibility.get("recommended_profile"),
+            "runtime_compatibility": self.compatibility.get("runtime_compatibility"),
+            "unverified_model": self.compatibility.get("unverified_model", False),
         }
 
     def to_json(self) -> str:
@@ -200,12 +210,17 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         quant = tcfg.get("quantization_config") or tcfg.get("quantization") or {}
 
     mtp = inspect_mtp_tensors(model_path, config) if config_exists else None
-    return ModelInspection(
+    inspection = ModelInspection(
         model_dir=str(model_path),
         config_exists=config_exists,
         architecture=architecture,
         model_type=tcfg.get("model_type") or config.get("model_type"),
-        mtp_num_hidden_layers=int(tcfg.get("mtp_num_hidden_layers") or 0),
+        mtp_num_hidden_layers=int(
+            tcfg.get("mtp_num_hidden_layers")
+            or tcfg.get("num_nextn_predict_layers")
+            or config.get("num_nextn_predict_layers")
+            or 0
+        ),
         hidden_size=tcfg.get("hidden_size"),
         num_hidden_layers=tcfg.get("num_hidden_layers"),
         vocab_size=tcfg.get("vocab_size"),
@@ -213,6 +228,24 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         sidecars={name: (model_path / name).exists() for name in MULTIMODAL_SIDECARS},
         model_files=tuple(sorted(p.name for p in model_path.glob("model*.safetensors"))),
         mtp=mtp,
+    )
+    from mtplx.backends.registry import compatibility_for_inspection
+
+    compatibility = compatibility_for_inspection(inspection).to_dict()
+    return ModelInspection(
+        model_dir=inspection.model_dir,
+        config_exists=inspection.config_exists,
+        architecture=inspection.architecture,
+        model_type=inspection.model_type,
+        mtp_num_hidden_layers=inspection.mtp_num_hidden_layers,
+        hidden_size=inspection.hidden_size,
+        num_hidden_layers=inspection.num_hidden_layers,
+        vocab_size=inspection.vocab_size,
+        quantization=inspection.quantization,
+        sidecars=inspection.sidecars,
+        model_files=inspection.model_files,
+        mtp=inspection.mtp,
+        compatibility=compatibility,
     )
 
 
