@@ -144,7 +144,17 @@ def _cmd_bench_preflight(args: argparse.Namespace) -> int:
 def _cmd_inspect_model(args: argparse.Namespace) -> int:
     from .artifacts import inspect_model
 
-    inspection = inspect_model(args.model)
+    try:
+        inspection = inspect_model(args.model)
+    except Exception as exc:
+        print(
+            json.dumps(
+                {"error": "inspect failed", "model": args.model, "detail": str(exc)},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 1
     print(inspection.to_json())
     compatibility = inspection.compatibility or {}
     if args.require_mtp or getattr(args, "strict_exit_code", True):

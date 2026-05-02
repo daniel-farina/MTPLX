@@ -96,7 +96,10 @@ def _model_gate(
     unsafe_force_unverified: bool = False,
     yes: bool = False,
 ) -> tuple[dict[str, Any], int | None]:
-    inspection = inspect_model(model).to_dict()
+    try:
+        inspection = inspect_model(model).to_dict()
+    except Exception as exc:
+        return {"error": "inspect failed", "model": model, "detail": str(exc)}, 1
     compatibility = inspection.get("compatibility") or {}
     tier = compatibility.get("tier")
     exit_code = int(compatibility.get("exit_code", EXIT_UNSUPPORTED_MODEL))
@@ -211,7 +214,11 @@ def cmd_inspect_model_public(args: Any) -> int:
         raise SystemExit("inspect accepts exactly one model path/repo id")
     if not model:
         raise SystemExit("inspect requires MODEL or --model MODEL")
-    inspection = inspect_model(model).to_dict()
+    try:
+        inspection = inspect_model(model).to_dict()
+    except Exception as exc:
+        _print({"error": "inspect failed", "model": model, "detail": str(exc)})
+        return 1
     _print(inspection)
     compatibility = inspection.get("compatibility") or {}
     exit_code = int(compatibility.get("exit_code", 0))

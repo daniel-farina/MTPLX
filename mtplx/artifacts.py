@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -69,6 +72,7 @@ class MTPInspection:
     tensor_count: int = 0
     sidecar_format: str = "bf16"
     expected_tensor_count: int = EXPECTED_MTP_TENSOR_COUNT
+    metadata_only: bool = False
     tensors: tuple[TensorInfo, ...] = ()
     missing_expected_keys: tuple[str, ...] = ()
     extra_keys: tuple[str, ...] = ()
@@ -89,6 +93,7 @@ class MTPInspection:
             "tensor_count": self.tensor_count,
             "sidecar_format": self.sidecar_format,
             "expected_tensor_count": self.expected_tensor_count,
+            "metadata_only": self.metadata_only,
             "passes_tensor_gate": self.passes_tensor_gate,
             "missing_expected_keys": list(self.missing_expected_keys),
             "extra_keys": list(self.extra_keys),
@@ -106,10 +111,14 @@ class ModelInspection:
     hidden_size: int | None
     num_hidden_layers: int | None
     vocab_size: int | None
+    source: str = "local"
     quantization: dict[str, Any] = field(default_factory=dict)
     sidecars: dict[str, bool] = field(default_factory=dict)
     model_files: tuple[str, ...] = ()
     mtp: MTPInspection | None = None
+    runtime_contract_data: dict[str, Any] | None = None
+    runtime_contract_error: str | None = None
+    runtime_contract_path: str | None = None
     compatibility: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -127,6 +136,7 @@ class ModelInspection:
     def to_dict(self) -> dict[str, Any]:
         return {
             "model_dir": self.model_dir,
+            "source": self.source,
             "config_exists": self.config_exists,
             "architecture": self.architecture,
             "model_type": self.model_type,
@@ -139,6 +149,7 @@ class ModelInspection:
             "model_files": list(self.model_files),
             "passes_primary_gate": self.passes_primary_gate,
             "mtp": self.mtp.to_dict() if self.mtp else None,
+            "runtime_contract_path": self.runtime_contract_path,
             "compatibility": self.compatibility,
             "mtp_supported": self.compatibility.get("mtp_supported"),
             "mtp_arch": self.compatibility.get("arch_id"),
@@ -197,7 +208,277 @@ def inspect_mtp_tensors(model_dir: Path | str, config: dict[str, Any] | None = N
     )
 
 
+def _is_local_like_model_ref(value: str) -> bool:
+    expanded = os.path.expanduser(value)
+    if Path(expanded).exists():
+        return True
+    if value.startswith(("/", "./", "../", "~")):
+        return True
+    first = value.split("/", 1)[0]
+    return first in {"models", "outputs", "RESEARCH:PLANS", "REFERENCES:TOOLS"}
+
+
+def _hf_repo_id_from_ref(value: Path | str) -> str | None:
+    text = str(value).strip()
+    if not text or _is_local_like_model_ref(text):
+        return None
+    parsed = urllib.parse.urlparse(text)
+    if parsed.scheme in {"http", "https"}:
+        host = parsed.netloc.lower()
+        if host not in {"huggingface.co", "www.huggingface.co"}:
+            return None
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) < 2:
+            return None
+        return "/".join(parts[:2])
+    if parsed.scheme:
+        return None
+    parts = [part for part in text.split("/") if part]
+    if len(parts) == 2 and all(part not in {".", ".."} for part in parts):
+        return "/".join(parts)
+    return None
+
+
+def _hf_download_json(repo_id: str, filename: str) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    try:
+        from huggingface_hub import hf_hub_download
+    except Exception as exc:
+        return None, None, f"huggingface_hub is required for HF inspection: {exc}"
+    try:
+        cache_dir = _hf_download_cache_dir()
+        kwargs = {"cache_dir": str(cache_dir)} if cache_dir else {}
+        path = hf_hub_download(
+            repo_id=repo_id,
+            filename=filename,
+            repo_type="model",
+            **kwargs,
+        )
+    except Exception as exc:
+        return None, None, str(exc)
+    try:
+        return json.loads(Path(path).read_text(encoding="utf-8")), path, None
+    except Exception as exc:
+        return None, path, str(exc)
+
+
+def _hf_download_cache_dir() -> Path | None:
+    if any(os.environ.get(name) for name in ("HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")):
+        return None
+    default = Path("~/.cache/huggingface").expanduser()
+    if default.is_symlink() and not default.exists():
+        fallback = Path("~/.mtplx/hf-cache").expanduser()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    try:
+        default.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        fallback = Path("~/.mtplx/hf-cache").expanduser()
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback
+    return None
+
+
+def _looks_like_missing_hf_file(error: str | None) -> bool:
+    text = str(error or "").lower()
+    return any(
+        marker in text
+        for marker in (
+            "404",
+            "entry not found",
+            "not found",
+            "does not exist",
+        )
+    )
+
+
+def _hf_list_repo_files(repo_id: str) -> tuple[set[str], str | None]:
+    try:
+        from huggingface_hub import HfApi
+    except Exception as exc:
+        return set(), f"huggingface_hub is required for HF inspection: {exc}"
+    try:
+        return set(HfApi().list_repo_files(repo_id=repo_id, repo_type="model")), None
+    except Exception as exc:
+        return set(), str(exc)
+
+
+def _hf_url(repo_id: str, filename: str) -> str:
+    from huggingface_hub import hf_hub_url
+
+    return hf_hub_url(repo_id=repo_id, filename=filename, repo_type="model")
+
+
+def _hf_token() -> str | None:
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        return token
+    try:
+        from huggingface_hub import get_token
+
+        return get_token()
+    except Exception:
+        return None
+
+
+def _hf_fetch_prefix(repo_id: str, filename: str, *, end: int) -> bytes:
+    headers = {"Range": f"bytes=0-{end}", "User-Agent": "mtplx-inspect/0.1"}
+    token = _hf_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    request = urllib.request.Request(_hf_url(repo_id, filename), headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
+
+
+def _remote_safetensors_keys(repo_id: str, filename: str) -> tuple[tuple[str, ...], str | None]:
+    try:
+        prefix = _hf_fetch_prefix(repo_id, filename, end=16_383)
+        if len(prefix) < 8:
+            return (), "safetensors header is shorter than 8 bytes"
+        header_len = int.from_bytes(prefix[:8], "little")
+        needed = 8 + header_len
+        if needed > 1_000_000:
+            return (), f"safetensors header too large for metadata-only inspect: {needed} bytes"
+        if len(prefix) < needed:
+            prefix = _hf_fetch_prefix(repo_id, filename, end=needed - 1)
+        header = json.loads(prefix[8:needed].decode("utf-8"))
+        return tuple(sorted(key for key in header if key != "__metadata__")), None
+    except Exception as exc:
+        return (), str(exc)
+
+
+def _inspect_mtp_tensors_from_keys(
+    mtp_file: str,
+    *,
+    config: dict[str, Any],
+    exists: bool,
+    keys: tuple[str, ...] = (),
+) -> MTPInspection:
+    mtp_quant = config.get("mtplx_mtp_quantization", {})
+    prequantized = isinstance(mtp_quant, dict) and bool(mtp_quant.get("prequantized"))
+    expected_keys = set(EXPECTED_PREQUANTIZED_MTP_KEYS if prequantized else EXPECTED_MTP_KEYS)
+    expected_count = (
+        EXPECTED_PREQUANTIZED_MTP_TENSOR_COUNT if prequantized else EXPECTED_MTP_TENSOR_COUNT
+    )
+    sidecar_format = "prequantized-mlx-affine" if prequantized else "bf16"
+    key_set = set(keys)
+    return MTPInspection(
+        mtp_file=mtp_file,
+        exists=exists,
+        tensor_count=len(keys),
+        sidecar_format=sidecar_format,
+        expected_tensor_count=expected_count,
+        metadata_only=True,
+        missing_expected_keys=tuple(sorted(expected_keys - key_set)) if keys else (),
+        extra_keys=tuple(sorted(key_set - expected_keys)) if keys else (),
+    )
+
+
+def _inspect_hf_model(repo_id: str) -> ModelInspection:
+    files, files_error = _hf_list_repo_files(repo_id)
+    config, config_path, config_error = _hf_download_json(repo_id, "config.json")
+    if config is None:
+        raise RuntimeError(
+            f"Could not inspect HF model {repo_id}: "
+            f"config.json unavailable: {config_error or files_error}"
+        )
+    runtime_contract_data, runtime_contract_path, runtime_contract_error = _hf_download_json(
+        repo_id,
+        "mtplx_runtime.json",
+    )
+    if runtime_contract_data is None and _looks_like_missing_hf_file(runtime_contract_error):
+        runtime_contract_error = None
+        runtime_contract_path = None
+    elif runtime_contract_data is None and runtime_contract_error:
+        runtime_contract_path = None
+    tcfg = text_config(config)
+    archs = config.get("architectures") or tcfg.get("architectures") or []
+    architecture = archs[0] if archs else None
+    quant = config.get("quantization_config") or config.get("quantization") or {}
+    if not quant:
+        quant = tcfg.get("quantization_config") or tcfg.get("quantization") or {}
+    mtp_file = str(expected_mtp_file(Path("."), config))
+    if mtp_file.startswith("./"):
+        mtp_file = mtp_file[2:]
+    mtp_file = mtp_file.lstrip("/")
+    mtp_exists = mtp_file in files if files else False
+    mtp_keys: tuple[str, ...] = ()
+    mtp_error = None
+    if mtp_exists and mtp_file.endswith(".safetensors"):
+        mtp_keys, mtp_error = _remote_safetensors_keys(repo_id, mtp_file)
+    mtp = _inspect_mtp_tensors_from_keys(
+        mtp_file,
+        config=config,
+        exists=mtp_exists,
+        keys=mtp_keys,
+    )
+    if mtp_error and not mtp_keys:
+        mtp = MTPInspection(
+            mtp_file=mtp_file,
+            exists=mtp_exists,
+            sidecar_format=mtp.sidecar_format,
+            expected_tensor_count=mtp.expected_tensor_count,
+            metadata_only=True,
+        )
+    inspection = ModelInspection(
+        model_dir=repo_id,
+        source="hf",
+        config_exists=True,
+        architecture=architecture,
+        model_type=tcfg.get("model_type") or config.get("model_type"),
+        mtp_num_hidden_layers=int(
+            tcfg.get("mtp_num_hidden_layers")
+            or tcfg.get("num_nextn_predict_layers")
+            or config.get("num_nextn_predict_layers")
+            or 0
+        ),
+        hidden_size=tcfg.get("hidden_size"),
+        num_hidden_layers=tcfg.get("num_hidden_layers"),
+        vocab_size=tcfg.get("vocab_size"),
+        quantization=quant,
+        sidecars={name: name in files for name in MULTIMODAL_SIDECARS},
+        model_files=tuple(
+            sorted(
+                name
+                for name in files
+                if Path(name).name.startswith("model") and name.endswith(".safetensors")
+            )
+        ),
+        mtp=mtp,
+        runtime_contract_data=runtime_contract_data,
+        runtime_contract_error=runtime_contract_error,
+        runtime_contract_path=(
+            runtime_contract_path if runtime_contract_data is not None else None
+        ),
+    )
+    from mtplx.backends.registry import compatibility_for_inspection
+
+    compatibility = compatibility_for_inspection(inspection).to_dict()
+    return ModelInspection(
+        model_dir=inspection.model_dir,
+        source=inspection.source,
+        config_exists=inspection.config_exists,
+        architecture=inspection.architecture,
+        model_type=inspection.model_type,
+        mtp_num_hidden_layers=inspection.mtp_num_hidden_layers,
+        hidden_size=inspection.hidden_size,
+        num_hidden_layers=inspection.num_hidden_layers,
+        vocab_size=inspection.vocab_size,
+        quantization=inspection.quantization,
+        sidecars=inspection.sidecars,
+        model_files=inspection.model_files,
+        mtp=inspection.mtp,
+        runtime_contract_data=inspection.runtime_contract_data,
+        runtime_contract_error=inspection.runtime_contract_error,
+        runtime_contract_path=inspection.runtime_contract_path,
+        compatibility=compatibility,
+    )
+
+
 def inspect_model(model_dir: Path | str) -> ModelInspection:
+    repo_id = _hf_repo_id_from_ref(model_dir)
+    if repo_id is not None:
+        return _inspect_hf_model(repo_id)
     model_path = Path(model_dir)
     config_path = model_path / "config.json"
     config_exists = config_path.exists()
@@ -212,6 +493,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     mtp = inspect_mtp_tensors(model_path, config) if config_exists else None
     inspection = ModelInspection(
         model_dir=str(model_path),
+        source="local",
         config_exists=config_exists,
         architecture=architecture,
         model_type=tcfg.get("model_type") or config.get("model_type"),
@@ -234,6 +516,7 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
     compatibility = compatibility_for_inspection(inspection).to_dict()
     return ModelInspection(
         model_dir=inspection.model_dir,
+        source=inspection.source,
         config_exists=inspection.config_exists,
         architecture=inspection.architecture,
         model_type=inspection.model_type,
@@ -245,6 +528,9 @@ def inspect_model(model_dir: Path | str) -> ModelInspection:
         sidecars=inspection.sidecars,
         model_files=inspection.model_files,
         mtp=inspection.mtp,
+        runtime_contract_data=inspection.runtime_contract_data,
+        runtime_contract_error=inspection.runtime_contract_error,
+        runtime_contract_path=inspection.runtime_contract_path,
         compatibility=compatibility,
     )
 

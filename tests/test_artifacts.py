@@ -6,7 +6,7 @@ import numpy as np
 from safetensors.numpy import save_file
 
 from mtplx.artifacts import expected_mtp_file, inspect_model
-from mtplx.constants import EXPECTED_PREQUANTIZED_MTP_KEYS
+from mtplx.constants import EXPECTED_MTP_KEYS, EXPECTED_PREQUANTIZED_MTP_KEYS
 
 
 def _write_runtime_contract(path, *, arch_id="qwen3-next-mtp", profile="stable"):
@@ -171,6 +171,24 @@ def test_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch, tmp_path):
     assert result.compatibility["unsafe_force_required"] is True
 
 
+def test_qwen3_next_architecture_without_mtp_sidecar_is_unverified(tmp_path):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3NextForCausalLM"],
+                "model_type": "qwen3_next",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = inspect_model(tmp_path)
+
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["exit_code"] == 3
+    assert result.compatibility["runtime_compatibility"] == "needs-grafting"
+
+
 def test_deepseek_mtp_is_incompatible_architecture(tmp_path):
     (tmp_path / "config.json").write_text(
         json.dumps(
@@ -197,5 +215,133 @@ def test_llama_without_mtp_is_no_mtp(tmp_path):
 
     result = inspect_model(tmp_path)
 
+    assert result.compatibility["tier"] == "no-MTP"
+    assert result.compatibility["exit_code"] == 2
+
+
+def test_hf_qwen_mtp_without_runtime_contract_is_unverified(monkeypatch):
+    from mtplx import artifacts
+
+    calls = []
+
+    def fake_files(repo_id):
+        assert repo_id == "Qwen/Qwen3-Next-80B-A3B-Instruct"
+        return {"config.json", "mtp.safetensors", "model.safetensors.index.json"}, None
+
+    def fake_json(repo_id, filename):
+        if filename == "config.json":
+            return (
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "mtp_num_hidden_layers": 1,
+                },
+                "/tmp/config.json",
+                None,
+            )
+        if filename == "mtplx_runtime.json":
+            return None, None, "404 Client Error: entry not found"
+        raise AssertionError(filename)
+
+    def fake_keys(repo_id, filename):
+        calls.append((repo_id, filename))
+        return tuple(sorted(EXPECTED_MTP_KEYS)), None
+
+    monkeypatch.setattr(artifacts, "_hf_list_repo_files", fake_files)
+    monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
+    monkeypatch.setattr(artifacts, "_remote_safetensors_keys", fake_keys)
+
+    result = inspect_model("Qwen/Qwen3-Next-80B-A3B-Instruct")
+
+    assert result.source == "hf"
+    assert result.mtp is not None
+    assert result.mtp.metadata_only is True
+    assert result.compatibility["tier"] == "architecture-compatible-but-unverified"
+    assert result.compatibility["exit_code"] == 3
+    assert calls == [("Qwen/Qwen3-Next-80B-A3B-Instruct", "mtp.safetensors")]
+
+
+def test_hf_verified_contract_passes_metadata_gate(monkeypatch):
+    from mtplx import artifacts
+
+    def fake_files(_repo_id):
+        return {"config.json", "mtplx_runtime.json", "mtp.safetensors"}, None
+
+    def fake_json(_repo_id, filename):
+        if filename == "config.json":
+            return (
+                {
+                    "architectures": ["Qwen3_5ForConditionalGeneration"],
+                    "model_type": "qwen3_5",
+                    "mtp_num_hidden_layers": 1,
+                    "mtplx_mtp_quantization": {
+                        "prequantized": True,
+                        "bits": 4,
+                        "group_size": 32,
+                        "mode": "affine",
+                    },
+                },
+                "/tmp/config.json",
+                None,
+            )
+        if filename == "mtplx_runtime.json":
+            return (
+                {
+                    "mtplx_version": "0.1.0-preview",
+                    "arch_id": "qwen3-next-mtp",
+                    "mtp_depth_max": 3,
+                    "recommended_profile": "stable",
+                    "exactness_baseline": {"phase0h": "smoke", "max_abs_diff": 0.0},
+                    "verified_on": {"timestamp": "2026-05-02T00:00:00Z"},
+                },
+                "/tmp/mtplx_runtime.json",
+                None,
+            )
+        raise AssertionError(filename)
+
+    monkeypatch.setattr(artifacts, "_hf_list_repo_files", fake_files)
+    monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
+    monkeypatch.setattr(
+        artifacts,
+        "_remote_safetensors_keys",
+        lambda _repo_id, _filename: (tuple(sorted(EXPECTED_PREQUANTIZED_MTP_KEYS)), None),
+    )
+
+    result = inspect_model("https://huggingface.co/mtplx/example/tree/main")
+
+    assert result.source == "hf"
+    assert result.mtp is not None
+    assert result.mtp.metadata_only is True
+    assert result.mtp.passes_tensor_gate is True
+    assert result.compatibility["tier"] == "verified"
+    assert result.compatibility["can_run"] is True
+    assert result.runtime_contract_path == "/tmp/mtplx_runtime.json"
+
+
+def test_hf_llama_without_mtp_is_no_mtp(monkeypatch):
+    from mtplx import artifacts
+
+    monkeypatch.setattr(
+        artifacts,
+        "_hf_list_repo_files",
+        lambda _repo_id: ({"config.json", "model.safetensors.index.json"}, None),
+    )
+
+    def fake_json(_repo_id, filename):
+        if filename == "config.json":
+            return (
+                {"architectures": ["LlamaForCausalLM"], "model_type": "llama"},
+                "/tmp/config.json",
+                None,
+            )
+        if filename == "mtplx_runtime.json":
+            return None, None, "404 Client Error: not found"
+        raise AssertionError(filename)
+
+    monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
+
+    result = inspect_model("https://huggingface.co/meta-llama/Llama-3.2-1B")
+
+    assert result.source == "hf"
     assert result.compatibility["tier"] == "no-MTP"
     assert result.compatibility["exit_code"] == 2

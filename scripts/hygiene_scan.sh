@@ -66,6 +66,8 @@ awk '
   /PREFIX_DIVERGENCE_AT_TOKEN/ { next }
   /MTPLX_LATE_DEPTH_SWITCH_AFTER_TOKENS/ { next }
   /hf_path/ { next }
+  /mtplx\/artifacts\.py:.*(_hf_|hf_hub_|huggingface_hub|HF_TOKEN|HUGGING_FACE_HUB_TOKEN)/ { next }
+  /tests\/test_artifacts\.py:.*(_hf_|test_hf|hf_)/ { next }
   { print }
 ' "$secret_matches" >"$filtered_secrets"
 

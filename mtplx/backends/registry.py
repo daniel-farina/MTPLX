@@ -177,11 +177,24 @@ def _has_mtp_markers(inspection: Any) -> bool:
 
 def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
     model_dir = Path(getattr(inspection, "model_dir", "."))
-    contract, contract_error = load_runtime_contract(model_dir)
+    contract_data = getattr(inspection, "runtime_contract_data", None)
+    contract_error = getattr(inspection, "runtime_contract_error", None)
+    if contract_data is not None:
+        try:
+            contract = RuntimeContract.from_dict(dict(contract_data))
+            contract_error = None
+        except Exception as exc:
+            contract = None
+            contract_error = str(exc)
+    else:
+        contract, local_contract_error = load_runtime_contract(model_dir)
+        contract_error = contract_error or local_contract_error
     detected_arch_id = _detect_arch_id(inspection)
     has_mtp = _has_mtp_markers(inspection)
     tensor_gate = bool(getattr(getattr(inspection, "mtp", None), "passes_tensor_gate", False))
-    contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
+    contract_path = getattr(inspection, "runtime_contract_path", None)
+    if not contract_path:
+        contract_path = str(_contract_path(model_dir)) if _contract_path(model_dir).exists() else None
 
     if contract is not None:
         arch_id = contract.arch_id
@@ -254,6 +267,31 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             runtime_compatibility="needs-grafting" if has_mtp else "unsupported",
         )
 
+    if detected_arch_id == "qwen3-next-mtp":
+        marker_text = (
+            "Qwen3-Next MTP markers detected"
+            if has_mtp
+            else "Qwen3-Next architecture detected"
+        )
+        return CompatibilityVerdict(
+            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
+            arch_id=detected_arch_id,
+            supported=False,
+            can_run=False,
+            exit_code=EXIT_UNVERIFIED,
+            message=(
+                f"{marker_text}, but no mtplx_runtime.json "
+                "verified contract is present. Use --unsafe-force-unverified "
+                "--yes to proceed without support guarantees."
+            ),
+            recommended_backend="qwen3_next",
+            recommended_profile=DEFAULT_PROFILE_NAME,
+            unsafe_force_required=True,
+            unverified_model=True,
+            mtp_supported="partial",
+            runtime_compatibility="needs-grafting",
+        )
+
     if not has_mtp:
         return CompatibilityVerdict(
             tier=TIER_NO_MTP,
@@ -266,26 +304,6 @@ def compatibility_for_inspection(inspection: Any) -> CompatibilityVerdict:
             ),
             mtp_supported="no",
             runtime_compatibility="unsupported",
-        )
-
-    if detected_arch_id == "qwen3-next-mtp":
-        return CompatibilityVerdict(
-            tier=TIER_ARCH_COMPATIBLE_UNVERIFIED,
-            arch_id=detected_arch_id,
-            supported=False,
-            can_run=False,
-            exit_code=EXIT_UNVERIFIED,
-            message=(
-                "Qwen3-Next MTP markers detected, but no mtplx_runtime.json "
-                "verified contract is present. Use --unsafe-force-unverified "
-                "--yes to proceed without support guarantees."
-            ),
-            recommended_backend="qwen3_next",
-            recommended_profile=DEFAULT_PROFILE_NAME,
-            unsafe_force_required=True,
-            unverified_model=True,
-            mtp_supported="partial",
-            runtime_compatibility="needs-grafting",
         )
 
     return CompatibilityVerdict(
