@@ -132,6 +132,29 @@ def test_run_refuses_non_mtp_model_without_importing_mlx(tmp_path: Path) -> None
     assert payload["model"]["compatibility"]["tier"] == "no-MTP"
 
 
+def test_run_reports_uncached_hf_model_without_importing_mlx(tmp_path: Path) -> None:
+    proc = _run_no_mlx(
+        tmp_path,
+        [
+            "-m",
+            "mtplx.cli",
+            "run",
+            "hello",
+            "--model",
+            "mtplx/example",
+            "--cache-dir",
+            str(tmp_path / "cache"),
+            "--json",
+        ],
+    )
+
+    assert proc.returncode == 1, proc.stderr
+    assert "Traceback" not in proc.stderr
+    payload = json.loads(proc.stdout)
+    assert payload["error"] == "model is not available locally"
+    assert "mtplx pull mtplx/example" in payload["detail"]
+
+
 def test_init_dry_run_without_mlx_does_not_write_config(tmp_path: Path) -> None:
     config = tmp_path / "config.toml"
 

@@ -8,6 +8,7 @@ from mtplx.hf_loader import (
     list_cached_models,
     remove_cached_model,
     repo_id_from_model_ref,
+    resolve_model_path,
     safe_model_name,
 )
 
@@ -24,6 +25,22 @@ def test_repo_id_from_model_ref_accepts_hf_url_and_repo_id():
 def test_safe_model_name_and_cache_path(tmp_path: Path):
     assert safe_model_name("mtplx/example") == "mtplx--example"
     assert cached_model_path("mtplx/example", cache_dir=tmp_path) == tmp_path / "mtplx--example"
+
+
+def test_resolve_model_path_uses_cache_for_hf_refs(tmp_path: Path):
+    cached = tmp_path / "mtplx--example"
+    cached.mkdir()
+
+    assert resolve_model_path("mtplx/example", cache_dir=tmp_path) == cached
+
+
+def test_resolve_model_path_reports_missing_cache(tmp_path: Path):
+    try:
+        resolve_model_path("mtplx/example", cache_dir=tmp_path)
+    except FileNotFoundError as exc:
+        assert "mtplx pull mtplx/example" in str(exc)
+    else:
+        raise AssertionError("expected missing cache error")
 
 
 def test_list_and_remove_cached_models(tmp_path: Path):

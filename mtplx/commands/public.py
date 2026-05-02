@@ -115,6 +115,19 @@ def _model_gate(
     return inspection, exit_code
 
 
+def _resolve_runtime_model_path(model: str, *, cache_dir: str | None = None) -> tuple[str, dict[str, Any] | None]:
+    from mtplx.hf_loader import resolve_model_path
+
+    try:
+        return str(resolve_model_path(model, cache_dir=cache_dir)), None
+    except Exception as exc:
+        return model, {
+            "error": "model is not available locally",
+            "model": model,
+            "detail": str(exc),
+        }
+
+
 def _exactness_profile_kwargs(args: Any) -> dict[str, Any]:
     return {
         "attention_impl": getattr(args, "exactness_attention_impl", "mlx_vector_paged"),
@@ -327,8 +340,15 @@ def _cmd_bench_run(args: Any) -> int:
             }
         )
         return 0
-    inspection, gate_exit = _model_gate(
+    runtime_model, resolve_error = _resolve_runtime_model_path(
         model,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        _print(resolve_error)
+        return 1
+    inspection, gate_exit = _model_gate(
+        runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
@@ -340,7 +360,7 @@ def _cmd_bench_run(args: Any) -> int:
 
     preflight = run_preflight(".")
     smoke = run_exactness_smoke(
-        model,
+        runtime_model,
         context=2048,
         prompt_suite=prompt_suite_path("flappy"),
         output=output_dir / "exactness-smoke.json",
@@ -354,7 +374,7 @@ def _cmd_bench_run(args: Any) -> int:
     if harness == "direct-http":
         return _cmd_bench_run_direct_http(
             args,
-            model=model,
+            model=runtime_model,
             suite=suite,
             run_id=run_id,
             output_dir=output_dir,
@@ -379,7 +399,7 @@ def _cmd_bench_run(args: Any) -> int:
         }
     ):
         result = _depth_sweep_native60(
-            model=model,
+            model=runtime_model,
             prompt_suite=prompt_suite,
             max_tokens=args.max_tokens,
             limit=args.limit,
@@ -1543,8 +1563,15 @@ def cmd_thermal_public(args: Any) -> int:
 
 def cmd_serve_public(args: Any) -> int:
     profile = get_profile(getattr(args, "profile", None) or DEFAULT_PROFILE_NAME)
-    inspection, gate_exit = _model_gate(
+    runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        _print(resolve_error)
+        return 1
+    inspection, gate_exit = _model_gate(
+        runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
@@ -1555,7 +1582,7 @@ def cmd_serve_public(args: Any) -> int:
         sys.executable,
         str(repo_root() / "scripts" / "serve_openai_mtplx.py"),
         "--model",
-        args.model,
+        runtime_model,
         "--host",
         args.host,
         "--port",
@@ -1583,8 +1610,14 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
     prompt = getattr(args, "prompt", None) or getattr(args, "prompt_arg", None)
     if not prompt:
         raise SystemExit(f"mtplx {command} requires a prompt")
-    inspection, gate_exit = _model_gate(
+    runtime_model, resolve_error = _resolve_runtime_model_path(
         args.model,
+        cache_dir=getattr(args, "cache_dir", None),
+    )
+    if resolve_error is not None:
+        return 1, resolve_error, []
+    inspection, gate_exit = _model_gate(
+        runtime_model,
         unsafe_force_unverified=bool(getattr(args, "unsafe_force_unverified", False)),
         yes=bool(getattr(args, "yes", False)),
     )
@@ -1598,7 +1631,7 @@ def _generate_one_shot_public(args: Any, *, command: str) -> tuple[int, dict[str
     from mtplx.runtime import load
     from mtplx.sampling import SamplerConfig
 
-    rt = load(args.model, mtp=True)
+    rt = load(runtime_model, mtp=True)
     messages = None
     system = getattr(args, "system", None)
     if system:

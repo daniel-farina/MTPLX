@@ -953,6 +953,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_p = sub.add_parser("run", help="Run a one-shot verified MTPLX completion")
     run_p.add_argument("prompt_arg", nargs="?", help="Prompt text")
     run_p.add_argument("--model", default=default_model)
+    run_p.add_argument("--cache-dir")
     run_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
     run_p.add_argument("--unsafe-force-unverified", action="store_true")
     run_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
@@ -971,6 +972,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     chat_p = sub.add_parser("chat", help="Run one native-MTP chat smoke generation")
     chat_p.add_argument("--model", default=default_model)
+    chat_p.add_argument("--cache-dir")
     chat_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
     chat_p.add_argument("--unsafe-force-unverified", action="store_true")
     chat_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
@@ -986,6 +988,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve_p = sub.add_parser("serve", help="Start the OpenAI-compatible MTPLX server")
     serve_p.add_argument("--model", default=default_model)
+    serve_p.add_argument("--cache-dir")
     serve_p.add_argument("--profile", choices=PROFILE_CHOICES, default=DEFAULT_PROFILE_NAME)
     serve_p.add_argument("--unsafe-force-unverified", action="store_true")
     serve_p.add_argument("--yes", action="store_true", help="Confirm unsafe non-interactive actions")
@@ -1093,6 +1096,7 @@ def build_parser() -> argparse.ArgumentParser:
     bench_p.add_argument("--cpu-threshold", type=float, default=25.0)
     bench_p.add_argument("--min-free-gib", type=float, default=25.0)
     bench_p.add_argument("--model", default=default_model)
+    bench_p.add_argument("--cache-dir")
     bench_p.add_argument("--prompts", default="mtplx/benchmarks/prompts/default.jsonl")
     bench_p.add_argument("--output")
     bench_p.add_argument("--temperature", type=float, default=0.6)

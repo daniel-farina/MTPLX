@@ -35,6 +35,21 @@ def cached_model_path(repo_id: str, *, cache_dir: str | Path | None = None) -> P
     return model_cache_dir(cache_dir) / safe_model_name(repo_id)
 
 
+def resolve_model_path(model_ref: str, *, cache_dir: str | Path | None = None) -> Path:
+    local = Path(model_ref).expanduser()
+    if local.exists():
+        return local
+    repo_id = repo_id_from_model_ref(model_ref)
+    if repo_id is None:
+        return local
+    cached = cached_model_path(repo_id, cache_dir=cache_dir)
+    if cached.exists():
+        return cached
+    raise FileNotFoundError(
+        f"Model {repo_id} is not cached. Run: mtplx pull {repo_id}"
+    )
+
+
 def directory_size_bytes(path: Path) -> int:
     total = 0
     if not path.exists():

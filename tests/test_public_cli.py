@@ -197,12 +197,13 @@ def test_public_bench_parser_has_seed_for_live_child_runs():
 def test_chat_and_serve_default_to_stable_profile():
     parser = build_parser()
 
-    run_args = parser.parse_args(["run", "hello"])
+    run_args = parser.parse_args(["run", "hello", "--cache-dir", "/tmp/mtplx-models"])
     chat_args = parser.parse_args(["chat", "--prompt", "hello"])
     serve_args = parser.parse_args(["serve"])
 
     assert run_args.profile == "stable"
     assert run_args.prompt_arg == "hello"
+    assert run_args.cache_dir == "/tmp/mtplx-models"
     assert chat_args.profile == "stable"
     assert serve_args.profile == "stable"
 
