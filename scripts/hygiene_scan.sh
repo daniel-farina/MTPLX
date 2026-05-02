@@ -5,6 +5,7 @@ root="${1:-.}"
 cd "$root"
 
 fail=0
+candidate_files="$(mktemp)"
 
 report_failure() {
   local title="$1"
@@ -14,49 +15,116 @@ report_failure() {
   fail=1
 }
 
+collect_candidate_files() {
+  if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    git ls-files --cached --others --exclude-standard -z >"$candidate_files"
+  else
+    find . \( \
+      -path './.git' -o \
+      -path './.venv' -o \
+      -path './venv' -o \
+      -path './.tox' -o \
+      -path './.nox' -o \
+      -path './.pytest_cache' -o \
+      -path './.mypy_cache' -o \
+      -path './__pycache__' -o \
+      -path './build' -o \
+      -path './dist' -o \
+      -path './*.egg-info' \
+    \) -prune -o -type f -print0 >"$candidate_files"
+  fi
+}
+
+for_each_candidate() {
+  local callback="$1"
+  while IFS= read -r -d '' path; do
+    [[ -f "$path" ]] || continue
+    "$callback" "$path"
+  done <"$candidate_files"
+}
+
+print_public_path() {
+  local path="$1"
+  if [[ "$path" == ./* ]]; then
+    printf '%s\n' "$path"
+  else
+    printf './%s\n' "$path"
+  fi
+}
+
+collect_candidate_files
+
 large_files="$(mktemp)"
-find . -path './.git' -prune -o -type f -size +50M -print >"$large_files"
+record_large_file() {
+  local path="$1"
+  if find "$path" -prune -type f -size +50M -print | grep -q .; then
+    print_public_path "$path"
+  fi
+}
+for_each_candidate record_large_file >"$large_files"
 if [[ -s "$large_files" ]]; then
   report_failure "Files larger than 50 MB are not allowed in the source repo" "$large_files"
 fi
 
 model_artifacts="$(mktemp)"
-find . -path './.git' -prune -o -type f \( \
-  -name '*.safetensors' -o \
-  -name '*.gguf' -o \
-  -name '*.mlx' -o \
-  -name '*.bin' -o \
-  -name '*.npz' -o \
-  -name '*.npy' \
-\) -print >"$model_artifacts"
+record_model_artifact() {
+  local path="$1"
+  case "$path" in
+    *.safetensors|*.gguf|*.mlx|*.bin|*.npz|*.npy)
+      print_public_path "$path"
+      ;;
+  esac
+}
+for_each_candidate record_model_artifact >"$model_artifacts"
 if [[ -s "$model_artifacts" ]]; then
   report_failure "Model artifacts do not belong in Git" "$model_artifacts"
 fi
 
 workspace_residue="$(mktemp)"
-find . -path './.git' -prune -o \( \
-  -path './models' -o \
-  -path './outputs' -o \
-  -path './REFERENCES:TOOLS' -o \
-  -path './DEEP RESEARCH HANDOFF' -o \
-  -path './IDE RESEARCH' -o \
-  -path './ProAgent Details' -o \
-  -path './.venv' -o \
-  -name '.webui_secret_key' \
-\) -print >"$workspace_residue"
+record_workspace_residue() {
+  local path="$1"
+  case "$path" in
+    models|models/*|./models|./models/*|\
+    outputs|outputs/*|./outputs|./outputs/*|\
+    REFERENCES:TOOLS|REFERENCES:TOOLS/*|./REFERENCES:TOOLS|./REFERENCES:TOOLS/*|\
+    "DEEP RESEARCH HANDOFF"|"DEEP RESEARCH HANDOFF"/*|./"DEEP RESEARCH HANDOFF"|./"DEEP RESEARCH HANDOFF"/*|\
+    "IDE RESEARCH"|"IDE RESEARCH"/*|./"IDE RESEARCH"|./"IDE RESEARCH"/*|\
+    "ProAgent Details"|"ProAgent Details"/*|./"ProAgent Details"|./"ProAgent Details"/*|\
+    *.webui_secret_key|*/.webui_secret_key)
+      print_public_path "$path"
+      ;;
+  esac
+}
+for_each_candidate record_workspace_residue >"$workspace_residue"
 if [[ -s "$workspace_residue" ]]; then
   report_failure "Private workspace residue found" "$workspace_residue"
 fi
 
 bad_names="$(mktemp)"
-find . -path './.git' -prune -o -type f -print \
-  | awk 'index($0, " ") || index($0, ":") { print }' >"$bad_names"
+record_bad_name() {
+  local path="$1"
+  if [[ "$path" == *" "* || "$path" == *":"* ]]; then
+    print_public_path "$path"
+  fi
+}
+for_each_candidate record_bad_name >"$bad_names"
 if [[ -s "$bad_names" ]]; then
   report_failure "Tracked/public paths must not contain spaces or colons" "$bad_names"
 fi
 
 secret_matches="$(mktemp)"
-rg --hidden --line-number --glob '!.git/**' --glob '!dist/**' --glob '!build/**' \
+rg --hidden --line-number \
+  --glob '!.git/**' \
+  --glob '!.venv/**' \
+  --glob '!venv/**' \
+  --glob '!.tox/**' \
+  --glob '!.nox/**' \
+  --glob '!.pytest_cache/**' \
+  --glob '!.mypy_cache/**' \
+  --glob '!__pycache__/**' \
+  --glob '!dist/**' \
+  --glob '!build/**' \
+  --glob '!*.egg-info/**' \
   'TOKEN|SECRET|PASSWORD|API_KEY|webui_secret|gho_|hf_' . >"$secret_matches" || true
 
 filtered_secrets="$(mktemp)"
