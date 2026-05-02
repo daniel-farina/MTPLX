@@ -17,6 +17,28 @@ def test_version_command_without_subcommand(capsys):
     assert "mtplx 0.1.0-preview (0.1.0rc0)" in captured
 
 
+def test_help_command_aliases_top_level_and_subcommands(capsys):
+    try:
+        main(["help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert "usage: mtplx" in capsys.readouterr().out
+
+    try:
+        main(["help", "run"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    run_help = capsys.readouterr().out
+    assert "usage: mtplx run" in run_help
+    assert "--max-tokens" in run_help
+
+    try:
+        main(["help", "qa", "exactness"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert "usage: mtplx qa exactness" in capsys.readouterr().out
+
+
 def test_run_json_model_summary_excludes_heavy_inspect_fields():
     summary = public._compact_model_summary(
         {

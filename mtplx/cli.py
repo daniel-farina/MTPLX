@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import shutil
+import sys
 from pathlib import Path
 
 from .constants import DEFAULT_RUNTIME_MODEL_DIR
@@ -1873,8 +1874,18 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _normalize_argv(argv: list[str] | None) -> list[str]:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "help":
+        if len(argv) == 1:
+            return ["--help"]
+        return [*argv[1:], "--help"]
+    return argv
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
+    argv = _normalize_argv(argv)
     args = parser.parse_args(argv)
     from .config import apply_user_config
 
