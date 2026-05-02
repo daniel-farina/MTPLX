@@ -340,7 +340,7 @@ def test_hf_llama_without_mtp_is_no_mtp(monkeypatch):
 
     monkeypatch.setattr(artifacts, "_hf_download_json", fake_json)
 
-    result = inspect_model("https://huggingface.co/meta-llama/Llama-3.2-1B")
+    result = inspect_model("https://huggingface.co/HuggingFaceTB/SmolLM2-135M")
 
     assert result.source == "hf"
     assert result.compatibility["tier"] == "no-MTP"
