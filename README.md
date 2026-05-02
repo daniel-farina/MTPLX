@@ -11,11 +11,12 @@ Native MTP speculative decoding for Qwen3-Next on Apple Silicon.
 > Preview status: v0.1.0-preview.1 ships the clean install surface, the verified cold MTP path, honest benchmark reporting, `mtplx help`, and OpenAI-compatible serving work in progress. Sustained no-fan long-context throughput is currently below target: recent Flappy 10k evidence is about 37 tok/s no-fan versus a 50+ tok/s goal. The default profile is `stable`. The cold 60+ tok/s path is opt-in as `--profile performance-cold`; `--max` is opt-in and is never required for the headline quick start.
 
 ```bash
-pip install mtplx
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
+python -m pip install './mtplx-0.1.0rc1-py3-none-any.whl[server]'
+mtplx help
 mtplx doctor --json
-mtplx inspect model --model mtplx/Qwen3.6-27B-MTPLX-GDN8-Speed4-CyanKiwiMTP --json
-mtplx init
-mtplx serve --port 8000
+mtplx init --model /path/to/verified/model --write
+mtplx serve --port 8000 --no-stats-footer
 ```
 
 MTPLX is for developers who want local, Apple-Silicon-native text inference with the model's built-in MTP heads instead of a separate draft model. It targets terminal workflows, Open WebUI, local coding harnesses, and OpenAI-compatible clients.
@@ -38,19 +39,23 @@ MTPLX is not DFlash, DDTree, or an external-drafter system. It is a native-MTP r
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -U pip
-python -m pip install mtplx
+gh release download v0.1.0-preview.1 --repo youssofal/mtplx --pattern 'mtplx-0.1.0rc1-py3-none-any.whl'
+python -m pip install './mtplx-0.1.0rc1-py3-none-any.whl[server]'
 
+mtplx help
 mtplx doctor --json
-mtplx init
-mtplx inspect model --model /path/to/model --json
+mtplx init --model /path/to/verified/model --write
+mtplx inspect /path/to/verified/model --json
 ```
+
+Public `pip install mtplx` is the Stage C target after PyPI Trusted Publishing is configured. The current private preview install path is the GitHub release wheel above.
 
 After selecting or downloading a verified model:
 
 ```bash
 mtplx run "Write a small Python function that parses a TOML file."
 mtplx chat
-mtplx serve --port 8000
+mtplx serve --port 8000 --no-stats-footer
 ```
 
 OpenAI-compatible smoke:
@@ -87,12 +92,12 @@ v0.1 supports Qwen3-Next-MTP only. DeepSeek V3 MTP, Llama-MTP, and generic MTP b
 
 ```bash
 mtplx doctor --json
-mtplx inspect model --model /path/or/hf/repo --json
+mtplx inspect /path/or/hf/repo --json
 mtplx init
 mtplx run "hello"
 mtplx chat
 mtplx bench run --suite cold-long-code-192 --max-tokens 192
-mtplx serve --port 8000
+mtplx serve --port 8000 --no-stats-footer
 mtplx max --status
 ```
 
