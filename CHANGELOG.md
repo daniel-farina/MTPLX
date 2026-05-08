@@ -45,6 +45,21 @@ All notable user-facing changes are recorded here.
   verification with opencode's researcher/planner/fixer/bug-patcher
   subagents shows non-zero per-session bytes and growing `cached_tokens`
   across turns of the same session id.
+- Fixed postcommit retokenization to encode the synthetic history with
+  the same `tools=` argument that produced the request's prompt.
+  `_history_ids_for_postcommit` and `_store_retokenized_history_snapshot`
+  previously called `_encode_messages` without `tools=`, while the next
+  request's prompt was built with `tools=tool_specs`. The Qwen3.6 chat
+  template injects tool definitions into the system message, so the
+  stored snapshot's tokens diverged from the next prompt at the system
+  boundary and SessionBank lookups failed with
+  `cache_miss_reason=prefix_divergence_at_token` even when the snapshot
+  successfully stored. `tool_specs` (gated by the same `tools_active`
+  flag used to build `prompt_ids`) now flows through every postcommit
+  pathway: the sync compatibility check, the sync retokenized commit,
+  and the async idle postcommit. The stored snapshot now reproduces the
+  exact prefix the next request will send, so subsequent turns of a
+  tool-using session reach the cached entry instead of cold-prefilling.
 
 ## v0.2.0
 

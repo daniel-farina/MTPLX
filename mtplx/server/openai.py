@@ -2222,6 +2222,7 @@ def _store_retokenized_history_snapshot(
     thinking_enabled: bool,
     policy_fingerprint: str,
     acquire_model_lock_blocking: bool = True,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
@@ -2238,6 +2239,7 @@ def _store_retokenized_history_snapshot(
         enable_thinking=thinking_enabled,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         add_generation_prompt=False,
+        tools=tool_specs,
     )
     history_ids = encoded_with_sentinel
     if not history_ids:
@@ -2310,6 +2312,7 @@ def _history_ids_for_postcommit(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None,
     thinking_enabled: bool,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     history_messages = list(messages) + [
         ChatMessage(
@@ -2324,6 +2327,7 @@ def _history_ids_for_postcommit(
         enable_thinking=thinking_enabled,
         strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
         add_generation_prompt=False,
+        tools=tool_specs,
     )
 
 
@@ -2336,6 +2340,7 @@ def _generation_final_postcommit_compatibility(
     assistant_content: str,
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if assistant_tool_calls:
         return {
@@ -2387,6 +2392,7 @@ def _generation_final_postcommit_compatibility(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
     if history_ids == final_token_ids:
         return {
@@ -2432,6 +2438,7 @@ def _store_generation_final_history_snapshot(
     assistant_tool_calls: list[dict[str, Any]] | None = None,
     thinking_enabled: bool,
     policy_fingerprint: str,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "mode": "unsafe", "reason": "no_session_id"}
@@ -2444,6 +2451,7 @@ def _store_generation_final_history_snapshot(
         assistant_content=assistant_content,
         assistant_tool_calls=assistant_tool_calls,
         thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
     if not bool(compatibility.get("safe")):
         return {
@@ -2520,6 +2528,7 @@ def _schedule_idle_postcommit_snapshot(
     thinking_enabled: bool,
     policy_fingerprint: str,
     unsafe_reason: str,
+    tool_specs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Schedule a background SessionBank commit for a response the
     generation-final compatibility check rejected as unsafe (most commonly
@@ -2593,6 +2602,7 @@ def _schedule_idle_postcommit_snapshot(
                     thinking_enabled=thinking_enabled,
                     policy_fingerprint=policy_fingerprint,
                     acquire_model_lock_blocking=False,
+                    tool_specs=tool_specs,
                 )
 
                 if postcommit.get("stored"):
@@ -5351,6 +5361,7 @@ def create_app(state: ServerState) -> FastAPI:
                 assistant_content=assistant_content,
                 assistant_tool_calls=assistant_tool_calls,
                 thinking_enabled=thinking_enabled,
+                tool_specs=tool_specs if tools_active else None,
             )
             if compatibility.get("safe"):
                 generated["stats"]["session_postcommit_snapshot"] = {
@@ -5383,6 +5394,7 @@ def create_app(state: ServerState) -> FastAPI:
                         thinking_enabled=thinking_enabled,
                         policy_fingerprint=policy_fingerprint,
                         unsafe_reason=unsafe_reason,
+                        tool_specs=tool_specs if tools_active else None,
                     )
                 )
                 return
@@ -5397,6 +5409,7 @@ def create_app(state: ServerState) -> FastAPI:
                     assistant_tool_calls=assistant_tool_calls,
                     thinking_enabled=thinking_enabled,
                     policy_fingerprint=policy_fingerprint,
+                    tool_specs=tool_specs if tools_active else None,
                 ),
             )
             generated["stats"]["session_postcommit_snapshot"] = postcommit
@@ -5539,6 +5552,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
+                                            tool_specs=tool_specs if tools_active else None,
                                         )
                                     else:
                                         postcommit = _store_generation_final_history_snapshot(
@@ -5551,6 +5565,7 @@ def create_app(state: ServerState) -> FastAPI:
                                             assistant_tool_calls=assistant_tool_calls,
                                             thinking_enabled=thinking_enabled,
                                             policy_fingerprint=policy_fingerprint,
+                                            tool_specs=tool_specs if tools_active else None,
                                         )
                                         if not postcommit.get("stored"):
                                             generated["stats"][
@@ -5899,6 +5914,7 @@ def create_app(state: ServerState) -> FastAPI:
                                         unsafe_reason=str(
                                             postcommit.get("reason") or "unsafe_history"
                                         ),
+                                        tool_specs=tool_specs if tools_active else None,
                                     )
                                 else:
                                     yield mark_sse_sent(
