@@ -357,13 +357,24 @@ class SessionBank:
         import time as _time
         safe_sess = sess_key.replace("/", "_").replace(" ", "_")
         path = f"/tmp/mtplx-divergence-{safe_sess}-{int(_time.time())}.json"
+        # Include any entry that shares a meaningful early prefix with the
+        # lookup, regardless of which session_id stored it. Same-session
+        # entries are kept first; then cross-session overlapping entries
+        # follow so we can see what *other* agent shape collided with us.
         candidates = []
+        floor = min(self._SHARED_PREFIX_FLOOR, len(lookup_tokens))
         for prefix, entry in self._entries.items():
-            if session_id is not None and entry.session_id != session_id:
+            same_session = entry.session_id == session_id
+            shares_floor = (
+                floor > 0
+                and len(prefix) >= floor
+                and prefix[:floor] == lookup_tokens[:floor]
+            )
+            if not (same_session or shares_floor):
                 continue
             # Scan the FULL overlapping range to find the actual divergence
             # point. Without this, a divergence beyond the dump head window
-            # (300 tokens) shows as first_diff=-1 and we can't locate it.
+            # shows as first_diff=-1 and we can't locate it.
             n = min(len(prefix), len(lookup_tokens))
             first_diff = -1
             for i in range(n):
@@ -372,9 +383,6 @@ class SessionBank:
                     break
             if first_diff < 0 and len(prefix) > len(lookup_tokens):
                 first_diff = len(lookup_tokens)
-            # If we found a real divergence, sample a window around it so we
-            # can decode the exact bytes that differ. Otherwise sample the
-            # head as before.
             if first_diff >= 0:
                 lo = max(0, first_diff - 100)
                 stored_window_lo = lo
@@ -385,6 +393,7 @@ class SessionBank:
             candidates.append({
                 "stored_len": len(prefix),
                 "stored_session_id": entry.session_id,
+                "same_session": same_session,
                 "first_divergence_at": first_diff,
                 "stored_window_offset": stored_window_lo,
                 "stored_window": stored_window,
