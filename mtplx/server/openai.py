@@ -504,6 +504,78 @@ def _startup_heartbeat(label: str, *, interval_s: float = 10.0) -> _StartupHeart
     return _StartupHeartbeat(label, interval_s=interval_s)
 
 
+def _apply_metal_memory_caps() -> dict[str, Any]:
+    """Pin MLX Metal allocator caps at startup to avoid wired-memory swap-out
+    pathologies under sustained long-context inference.
+
+    On Apple Silicon, MLX's Metal allocator can grow the wired pool past safe
+    headroom under back-to-back >30 K-token requests. When the OS starts
+    swapping, decode collapses ~10x (50 t/s -> 2.5 t/s) and the kernel may kill
+    the process. Setting both caps at startup keeps the allocator inside a
+    fixed budget; ``clear_cache`` periodically drops idle pool memory.
+
+    Operators can override via env:
+      MTPLX_MEMORY_LIMIT_BYTES   - hard cap, default 75% of total RAM
+      MTPLX_WIRED_LIMIT_BYTES    - wired (resident) cap, default 60% of total RAM
+
+    Both accept plain bytes or K/M/G/T suffix.
+    """
+    import mlx.core as mx
+    if not mx.metal.is_available():
+        return {"applied": False, "reason": "metal_unavailable"}
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    total_ram = 0
+    if psutil is not None:
+        try:
+            total_ram = int(psutil.virtual_memory().total)
+        except Exception:
+            total_ram = 0
+
+    def _parse_size(env_name: str, default_bytes: int) -> int:
+        raw = (os.environ.get(env_name) or "").strip().upper()
+        if not raw:
+            return default_bytes
+        suffix_map = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+        if raw[-1] in suffix_map:
+            try:
+                return int(float(raw[:-1]) * suffix_map[raw[-1]])
+            except ValueError:
+                return default_bytes
+        try:
+            return int(raw)
+        except ValueError:
+            return default_bytes
+
+    default_mem = max(8 * 1024**3, int(total_ram * 0.75)) if total_ram else 96 * 1024**3
+    default_wired = max(4 * 1024**3, int(total_ram * 0.60)) if total_ram else 60 * 1024**3
+    mem_limit = _parse_size("MTPLX_MEMORY_LIMIT_BYTES", default_mem)
+    wired_limit = _parse_size("MTPLX_WIRED_LIMIT_BYTES", default_wired)
+
+    applied: dict[str, Any] = {"applied": True}
+    # Prefer the new top-level mx.set_memory_limit / mx.set_wired_limit; fall
+    # back to the deprecated mx.metal.* names if running on an older MLX.
+    try:
+        if hasattr(mx, "set_memory_limit"):
+            mx.set_memory_limit(int(mem_limit))
+        else:
+            mx.metal.set_memory_limit(int(mem_limit))
+        applied["memory_limit_bytes"] = int(mem_limit)
+    except Exception as exc:
+        applied["memory_limit_error"] = str(exc)
+    try:
+        if hasattr(mx, "set_wired_limit"):
+            mx.set_wired_limit(int(wired_limit))
+        else:
+            mx.metal.set_wired_limit(int(wired_limit))
+        applied["wired_limit_bytes"] = int(wired_limit)
+    except Exception as exc:
+        applied["wired_limit_error"] = str(exc)
+    return applied
+
+
 class ServerState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -518,6 +590,7 @@ class ServerState:
         self.generation_executor = self.model_scheduler
         self.postcommit_executor = None
         self.rate_limiter = _RateLimiter(args.rate_limit)
+        self.metal_memory_caps = _apply_metal_memory_caps()
         self.profile = get_profile(args.profile)
         runtime_label = {
             "performance-cold": "Burst MTP",
