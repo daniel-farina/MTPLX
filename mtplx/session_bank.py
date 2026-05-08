@@ -280,27 +280,54 @@ class SessionBank:
         self._evict_if_needed(protected_tokens=tokens)
         return entry
 
+    # Threshold (in tokens) for considering two requests to be the "same
+    # configuration family" for purposes of distinguishing a true new
+    # session/agent from a real intra-config prefix divergence. ~100 tokens
+    # is enough to span a system prompt header and the start of a tools
+    # list, which is the boundary where unrelated agents diverge.
+    _SHARED_PREFIX_FLOOR = 100
+
     def longest_prefix(
         self,
         token_ids: list[int] | tuple[int, ...],
         *,
         session_id: str | None = None,
     ) -> SessionBankEntry | None:
+        """Find the longest stored entry whose tokens are a prefix of the
+        lookup tokens.
+
+        Matches across ALL sessions intentionally: two agents/sessions that
+        happen to send the same system prompt + tools have byte-identical
+        prefixes regardless of how the client labelled the session, and they
+        should share the cache. This makes the bank scale to an arbitrary
+        number of opencode sub-agents without requiring per-agent provider
+        configuration on the client.
+
+        The optional `session_id` is used only by the diagnostic dump path
+        to scope its log filename - it does NOT gate matching.
+        """
         tokens = tuple(int(token) for token in token_ids)
         best: SessionBankEntry | None = None
-        same_session_entries_present = False
+        # Track whether any stored entry shares a meaningful prefix with the
+        # lookup. If so, a miss is a real intra-config divergence worth
+        # dumping. If not, the miss is a fresh agent/config and not a bug.
+        has_overlapping_family = False
+        floor = min(self._SHARED_PREFIX_FLOOR, len(tokens))
         for prefix, entry in self._entries.items():
-            if session_id is not None and entry.session_id != session_id:
-                continue
-            same_session_entries_present = True
+            if (
+                floor > 0
+                and len(prefix) >= floor
+                and prefix[:floor] == tokens[:floor]
+            ):
+                has_overlapping_family = True
             if len(prefix) > len(tokens):
                 continue
             if tokens[: len(prefix)] != prefix:
                 continue
             if best is None or len(prefix) > len(best.token_ids):
                 best = entry
-        if best is None and same_session_entries_present:
-            # Real divergence within the calling session - dump diagnostics.
+        if best is None and has_overlapping_family:
+            # Real divergence within the same agent/config - worth diagnosing.
             self._maybe_dump_divergence(tokens, session_id=session_id)
         return best
 
@@ -382,20 +409,21 @@ class SessionBank:
             raise ValueError("mode must be 'clone', 'reference', or 'reference_lease'")
         self.last_miss_reason = None
         self._purge_expired()
-        entry = self.longest_prefix(token_ids, session_id=session_id)
+        tokens_tuple = tuple(int(t) for t in token_ids)
+        entry = self.longest_prefix(tokens_tuple, session_id=session_id)
         if entry is None:
-            # Distinguish "no entries from THIS session" (true new_session)
-            # from "entries from this session exist but lookup tokens diverge"
-            # (true prefix divergence). The session-scoped check below is what
-            # makes the miss reason actually meaningful: cross-session entries
-            # in the global bank no longer falsely trip prefix_divergence.
-            same_session_present = (
-                session_id is not None
-                and any(
-                    e.session_id == session_id for e in self._entries.values()
-                )
-            )
-            if same_session_present or (session_id is None and self._entries):
+            # Honest miss labelling - content-based, not session-based:
+            # - If at least one stored entry shares a non-trivial early
+            #   prefix with the lookup, the miss is a real divergence inside
+            #   the same agent/config family (worth investigating).
+            # - Otherwise the lookup belongs to a different agent/config
+            #   shape, which is a normal cold start (new_session).
+            floor = min(self._SHARED_PREFIX_FLOOR, len(tokens_tuple))
+            has_overlapping_family = any(
+                len(p) >= floor and p[:floor] == tokens_tuple[:floor]
+                for p in self._entries.keys()
+            ) if floor > 0 else False
+            if has_overlapping_family:
                 self.last_miss_reason = (
                     CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
                 )
