@@ -2255,6 +2255,22 @@ def _store_retokenized_history_snapshot(
             "reason": "model_lock_busy_before_retokenized_commit",
             "elapsed_s": time.perf_counter() - started,
         }
+    # Pass `session_bank` so the postcommit prefill reuses the longest
+    # matching prefix from a prior turn instead of re-prefilling the full
+    # ~18K-token history from scratch. On consecutive tool-calling turns
+    # this collapses postcommit cost from ~27 s (full re-prefill) to ~1 s
+    # (suffix forward only), which matters because PR #24 routed this work
+    # through `state.generation_executor` (single-worker) to keep MLX
+    # streams thread-local. With the full re-prefill, the next foreground
+    # request was queueing 27-30 s behind this task; with the prefix
+    # shortcut the queue stall drops to roughly the suffix forward time.
+    #
+    # The bank already contains an entry for the previous turn's history
+    # (this same function stored it on the prior postcommit). The new
+    # turn's history starts with that previous-turn prefix verbatim
+    # (chat-template encoding is deterministic for the same messages and
+    # tools), so `longest_prefix` matches and only the new user turn +
+    # assistant turn need to be forward-AR'd.
     try:
         with attention_phase("postcommit"):
             prompt_state = restore_or_prefill_prompt_state(
@@ -2262,6 +2278,10 @@ def _store_retokenized_history_snapshot(
                 history_ids,
                 mtp_hidden_variant="post_norm",
                 mtp_history_policy="committed",
+                session_bank=state.sessions.bank,
+                template_hash=state.template_hash,
+                draft_head_identity=state.draft_head_identity,
+                policy_fingerprint=policy_fingerprint,
             )
         mtp_snapshot = (
             snapshot_cache(prompt_state.committed_mtp_cache)
@@ -2302,6 +2322,9 @@ def _store_retokenized_history_snapshot(
         "nbytes": entry.nbytes,
         "elapsed_s": time.perf_counter() - started,
         "token_hash": entry.token_hash,
+        "cache_hit": bool(getattr(prompt_state, "cache_hit", False)),
+        "cached_tokens": int(getattr(prompt_state, "cached_tokens", 0) or 0),
+        "suffix_tokens": int(getattr(prompt_state, "suffix_tokens", 0) or 0),
     }
 
 
@@ -2575,6 +2598,50 @@ def _schedule_idle_postcommit_snapshot(
             # Logging must never bring down the executor; fail silently.
             pass
 
+    postcommit_executor = getattr(state, "postcommit_executor", None)
+    use_two_stage = (
+        postcommit_executor is not None
+        and postcommit_executor is not state.generation_executor
+    )
+
+    def _store_directly() -> dict[str, Any]:
+        return _store_retokenized_history_snapshot(
+            state,
+            session_id=session_id,
+            messages=messages,
+            assistant_content=assistant_content,
+            assistant_tool_calls=assistant_tool_calls,
+            thinking_enabled=thinking_enabled,
+            policy_fingerprint=policy_fingerprint,
+            acquire_model_lock_blocking=False,
+            tool_specs=tool_specs,
+        )
+
+    def _run_store_on_generation_executor() -> dict[str, Any]:
+        """Run the actual MLX-touching snapshot work on `generation_executor`.
+
+        This MUST run on `generation_executor` because the SessionBank entry
+        is restored from `generation_executor`'s thread on subsequent turns,
+        and MLX streams on Apple Silicon are thread-local: a cache buffer
+        created on one thread raises
+        `RuntimeError: There is no Stream(gpu, N) in current thread` when
+        accessed from another. PR #24 (commit 3d9f200) established this
+        invariant after the original `postcommit_executor` introduced cross-
+        thread restore failures.
+
+        When `postcommit_executor` is unavailable or aliased to
+        `generation_executor` (test stubs), we call the snapshot function
+        directly to avoid a single-worker deadlock.
+        """
+        if not use_two_stage:
+            return _store_directly()
+        future = state.generation_executor.submit(_store_directly)
+        # Real `concurrent.futures.Future` exposes `.result()`; some test
+        # stubs return the function's value directly from `submit`.
+        if hasattr(future, "result"):
+            return future.result()
+        return future  # type: ignore[return-value]
+
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
         try:
@@ -2592,18 +2659,15 @@ def _schedule_idle_postcommit_snapshot(
             # foreground flag never clears - waiting on it caused every
             # subagent's snapshot to be abandoned and the SessionBank to
             # stay empty for those session ids.
+            #
+            # The retry/sleep loop runs on `postcommit_executor` so the
+            # 250 ms inter-attempt sleep does not occupy
+            # `generation_executor` and head-of-line block the next
+            # foreground request. The actual MLX-touching snapshot call is
+            # submitted to `generation_executor` via
+            # `_run_store_on_generation_executor` (cross-thread MLX safety).
             while True:
-                postcommit = _store_retokenized_history_snapshot(
-                    state,
-                    session_id=session_id,
-                    messages=messages,
-                    assistant_content=assistant_content,
-                    assistant_tool_calls=assistant_tool_calls,
-                    thinking_enabled=thinking_enabled,
-                    policy_fingerprint=policy_fingerprint,
-                    acquire_model_lock_blocking=False,
-                    tool_specs=tool_specs,
-                )
+                postcommit = _run_store_on_generation_executor()
 
                 if postcommit.get("stored"):
                     _log(postcommit)
@@ -2639,17 +2703,26 @@ def _schedule_idle_postcommit_snapshot(
                 }
             )
 
-    # Route through generation_executor instead of a separate postcommit
-    # thread. MLX streams on Apple Silicon are thread-local, so a SessionBank
-    # entry created on one thread cannot be restored from another - the
-    # restore path raises "There is no Stream(gpu, N) in current thread".
-    # PR #17 introduced a dedicated postcommit_executor to keep this work off
-    # the foreground latency path, but in practice the non-blocking lock
-    # acquire inside _store_retokenized_history_snapshot already guarantees
-    # the postcommit yields when foreground actually wants to run, and
-    # queueing on generation_executor is the v0.1.6 behaviour that did not
-    # have this cross-thread issue.
-    state.generation_executor.submit(async_postcommit)
+    # Architecture: Option B (Tier 2.1) + Option A (small dose).
+    #
+    # Option B is the primary win. `_store_retokenized_history_snapshot`
+    # now passes `session_bank` to `restore_or_prefill_prompt_state`, so
+    # the postcommit reuses the previous turn's SessionBank entry as a
+    # prefix and only forward-AR's the new suffix. This collapses postcommit
+    # cost from ~27 s (full 18K-token re-prefill) to ~1 s (suffix forward
+    # only) on consecutive tool-calling turns. The next foreground request
+    # therefore queues only ~1 s, not ~30 s.
+    #
+    # Option A (small dose): the orchestration loop runs on
+    # `postcommit_executor` so the 250 ms inter-attempt sleep does not
+    # occupy `generation_executor`, but the actual MLX work is still
+    # submitted to `generation_executor` to preserve the cross-thread MLX
+    # stream invariant established by PR #24 (commit 3d9f200). The first-
+    # turn case (no prefix in the bank yet, so still a full re-prefill)
+    # remains a head-of-line block of the next request, but it is much
+    # less common than the steady-state multi-turn case.
+    executor = postcommit_executor if use_two_stage else state.generation_executor
+    executor.submit(async_postcommit)
     return pending
 
 
