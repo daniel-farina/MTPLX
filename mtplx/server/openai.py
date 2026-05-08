@@ -2852,7 +2852,17 @@ def _schedule_idle_postcommit_snapshot(
     # remains a head-of-line block of the next request, but it is much
     # less common than the steady-state multi-turn case.
     executor = postcommit_executor if use_two_stage else state.generation_executor
-    executor.submit(async_postcommit)
+    future = executor.submit(async_postcommit)
+    # Record the future on the EngineSession so the next request in this
+    # session can wait for the bank entry to land before its lookup. Without
+    # this, fast follow-up turns miss the cache for ~4-5 turns until the
+    # postcommit train catches up.
+    if session_id:
+        try:
+            session = state.sessions.get_or_create(session_id)
+            session.pending_postcommit = future
+        except Exception:
+            pass
     return pending
 
 

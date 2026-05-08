@@ -202,6 +202,11 @@ class EngineSession:
         self.last_restore_mode: str = "cold"
         self.bytes_estimate = 0
         self._lock = Lock()
+        # Future for the pending postcommit of the most recent generation in
+        # this session. The next request waits briefly on this so the bank has
+        # the prior turn's entry available at lookup time, avoiding a cold
+        # re-prefill cascade across the first 4-5 turns of a fresh session.
+        self.pending_postcommit: Any = None
 
     @property
     def prefix_len(self) -> int:
@@ -214,8 +219,54 @@ class EngineSession:
         now = time.time() if now_s is None else float(now_s)
         return now - self.last_access_s > self.idle_ttl_s
 
+    def wait_for_pending_postcommit(self, *, timeout_s: float = 10.0) -> dict[str, Any]:
+        """Block briefly for the prior postcommit's SessionBank entry to land
+        so this request's lookup can warm-start. Returns a small dict for
+        telemetry: `{"waited": bool, "elapsed_s": float, "outcome": str}`.
+
+        Design notes - this MUST be called WITHOUT the session lock held.
+        The postcommit it waits on submits MLX work to `generation_executor`
+        via `Future.result()`. If we held the session lock, that lock plus
+        a single-worker generation_executor would cycle: foreground holds
+        lock waiting on postcommit, postcommit tries to run on
+        generation_executor, generation_executor is free but the postcommit
+        future never resolves because the actual MLX work is queued behind
+        another item that... in practice this manifests as foreground hangs
+        of 100+ s.
+
+        Bounded timeout (5 s default) so a stuck postcommit can't block the
+        request indefinitely; the request just falls through to a cold
+        prefill, same outcome as no-wait.
+        """
+        future = self.pending_postcommit
+        if future is None:
+            return {"waited": False, "elapsed_s": 0.0, "outcome": "no_pending"}
+        # Drop the reference up-front so a subsequent call doesn't double-wait.
+        self.pending_postcommit = None
+        if not hasattr(future, "result"):
+            return {"waited": False, "elapsed_s": 0.0, "outcome": "not_a_future"}
+        t0 = time.monotonic()
+        try:
+            future.result(timeout=timeout_s)
+            return {
+                "waited": True,
+                "elapsed_s": time.monotonic() - t0,
+                "outcome": "completed",
+            }
+        except BaseException as exc:
+            return {
+                "waited": True,
+                "elapsed_s": time.monotonic() - t0,
+                "outcome": f"timeout_or_error:{type(exc).__name__}",
+            }
+
     @contextmanager
     def in_flight_generation(self) -> Iterator["EngineSession"]:
+        # Wait BEFORE acquiring the session lock so the postcommit task is
+        # free to use generation_executor without contending with us. Without
+        # this ordering, the foreground request could hold the session lock
+        # while the postcommit's blocked .result() call prevents progress.
+        self.wait_for_pending_postcommit()
         if not self._lock.acquire(blocking=False):
             raise EngineSessionBusy(f"session {self.session_id} is already in flight")
         self.in_flight = True

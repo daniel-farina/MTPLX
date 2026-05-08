@@ -280,17 +280,87 @@ class SessionBank:
         self._evict_if_needed(protected_tokens=tokens)
         return entry
 
-    def longest_prefix(self, token_ids: list[int] | tuple[int, ...]) -> SessionBankEntry | None:
+    def longest_prefix(
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        *,
+        session_id: str | None = None,
+    ) -> SessionBankEntry | None:
         tokens = tuple(int(token) for token in token_ids)
         best: SessionBankEntry | None = None
+        same_session_entries_present = False
         for prefix, entry in self._entries.items():
+            if session_id is not None and entry.session_id != session_id:
+                continue
+            same_session_entries_present = True
             if len(prefix) > len(tokens):
                 continue
             if tokens[: len(prefix)] != prefix:
                 continue
             if best is None or len(prefix) > len(best.token_ids):
                 best = entry
+        if best is None and same_session_entries_present:
+            # Real divergence within the calling session - dump diagnostics.
+            self._maybe_dump_divergence(tokens, session_id=session_id)
         return best
+
+    def _maybe_dump_divergence(
+        self,
+        lookup_tokens: tuple[int, ...],
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        """Diagnostic: when a lookup misses despite stored entries from the
+        same session, dump lookup vs stored token IDs so we can diff them
+        and identify the canonicalization gap. Env-gated, one-shot per session
+        to avoid log spam.
+        """
+        import os
+        if os.environ.get("MTPLX_DUMP_DIVERGENCE") != "1":
+            return
+        dumped = getattr(self, "_divergence_dumped_sessions", None)
+        if dumped is None:
+            dumped = set()
+            self._divergence_dumped_sessions = dumped
+        sess_key = session_id or "_unscoped"
+        if sess_key in dumped:
+            return
+        dumped.add(sess_key)
+        import json as _json
+        import time as _time
+        safe_sess = sess_key.replace("/", "_").replace(" ", "_")
+        path = f"/tmp/mtplx-divergence-{safe_sess}-{int(_time.time())}.json"
+        candidates = []
+        for prefix, entry in self._entries.items():
+            if session_id is not None and entry.session_id != session_id:
+                continue
+            n = min(len(prefix), len(lookup_tokens), 300)
+            first_diff = -1
+            for i in range(n):
+                if prefix[i] != lookup_tokens[i]:
+                    first_diff = i
+                    break
+            if first_diff < 0 and len(prefix) > len(lookup_tokens):
+                first_diff = len(lookup_tokens)
+            candidates.append({
+                "stored_len": len(prefix),
+                "stored_session_id": entry.session_id,
+                "first_divergence_at": first_diff,
+                "stored_head": list(prefix[:300]),
+                "stored_tail": list(prefix[-100:]) if len(prefix) > 100 else None,
+            })
+        try:
+            with open(path, "w") as f:
+                _json.dump({
+                    "session_id": session_id,
+                    "lookup_len": len(lookup_tokens),
+                    "lookup_head": list(lookup_tokens[:300]),
+                    "lookup_tail": list(lookup_tokens[-100:]) if len(lookup_tokens) > 100 else None,
+                    "stored_entries": candidates,
+                }, f)
+            print(f"[mtplx] dumped divergence diagnostic to {path}", flush=True)
+        except Exception as e:
+            print(f"[mtplx] divergence dump failed: {e}", flush=True)
 
     def restore(
         self,
