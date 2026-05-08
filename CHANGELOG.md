@@ -29,6 +29,22 @@ All notable user-facing changes are recorded here.
   mode for `<tool_call>` markers (with proper handling of partial markers
   spanning multiple stream chunks). Tool-only responses and pure-text
   responses are unchanged. Closes #20.
+- Fixed `_schedule_idle_postcommit_snapshot` so it commits SessionBank
+  snapshots for back-to-back subagent fan-out workloads. Previously the
+  async path waited for `state.has_foreground()` to clear, which in
+  OpenAI-compatible agent clients (opencode, Aider) with multiple
+  subagents never happens - the parent dispatches the next subagent
+  request within milliseconds of the previous response completing, so
+  the 30-second idle deadline always expired and the snapshot was
+  abandoned with `foreground_busy_past_deadline`. Subagent sessions
+  therefore never accumulated a bank entry and paid full cold prefill on
+  every turn (cached_tokens=0) even with a stable session_id. The async
+  path now retries the existing non-blocking lock acquire inside
+  `_store_retokenized_history_snapshot` (which is the real correctness
+  gate) until either the snapshot stores or the deadline expires. Live
+  verification with opencode's researcher/planner/fixer/bug-patcher
+  subagents shows non-zero per-session bytes and growing `cached_tokens`
+  across turns of the same session id.
 
 ## v0.2.0
 

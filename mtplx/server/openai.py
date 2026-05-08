@@ -2529,10 +2529,15 @@ def _schedule_idle_postcommit_snapshot(
     The retokenized-history path canonicalises tool_call responses into the
     exact prefix the next request will send, so the commit is safe - it just
     must not run on the request thread (would extend stream latency). This
-    function dispatches that work to the postcommit executor, where it waits
-    for the foreground to go idle and then runs the synchronous retokenized
-    commit. If the foreground stays busy past the deadline we abandon, since
-    a later commit would race the next turn's prefill.
+    function dispatches that work to the postcommit executor, which then
+    repeatedly attempts the retokenized commit using the existing
+    non-blocking model-lock acquire inside `_store_retokenized_history_snapshot`
+    as the correctness gate. If the lock is held by a foreground prefill we
+    sleep briefly and retry; if the lock stays held past the deadline we
+    abandon, since a later commit would race the next turn's prefill. Any
+    non-recoverable result (no_session_id, empty_boundary_prefix,
+    sessionbank_snapshot_skipped, or a successful store) is logged and
+    returned immediately without retrying.
     """
     pending = {
         "stored": False,
@@ -2564,39 +2569,57 @@ def _schedule_idle_postcommit_snapshot(
     def async_postcommit() -> None:
         deadline = time.monotonic() + _IDLE_POSTCOMMIT_MAX_WAIT_S
         try:
-            # Wait for the foreground request to release the model. We poll
-            # both the foreground flag and the model lock; if either is held
-            # the next prefill is imminent or already running and committing
-            # now would either stall it or race it. We bound the wait so a
-            # back-pressured server never accumulates a backlog of stale
-            # commit work.
-            while state.has_foreground() or state.lock.locked():
+            # Loop until either the snapshot stores, a non-recoverable result
+            # comes back, or the deadline expires. The non-blocking lock
+            # acquire inside `_store_retokenized_history_snapshot` is the
+            # real correctness gate - if a foreground prefill holds the
+            # model lock, the helper fails fast with
+            # "model_lock_busy_before_retokenized_commit" and the
+            # background work never delays the foreground request. We do
+            # NOT gate on `state.has_foreground()`: in OpenAI-compatible
+            # subagent fan-out (opencode researcher / planner / fixer /
+            # bug-patcher) the parent re-dispatches the next request within
+            # milliseconds of the previous response completing, so the
+            # foreground flag never clears - waiting on it caused every
+            # subagent's snapshot to be abandoned and the SessionBank to
+            # stay empty for those session ids.
+            while True:
+                postcommit = _store_retokenized_history_snapshot(
+                    state,
+                    session_id=session_id,
+                    messages=messages,
+                    assistant_content=assistant_content,
+                    assistant_tool_calls=assistant_tool_calls,
+                    thinking_enabled=thinking_enabled,
+                    policy_fingerprint=policy_fingerprint,
+                    acquire_model_lock_blocking=False,
+                )
+
+                if postcommit.get("stored"):
+                    _log(postcommit)
+                    return
+
+                if (
+                    postcommit.get("reason")
+                    != "model_lock_busy_before_retokenized_commit"
+                ):
+                    # Non-recoverable result (no_session_id,
+                    # empty_boundary_prefix, sessionbank_snapshot_skipped,
+                    # etc.) - retrying will not help.
+                    _log(postcommit)
+                    return
+
                 if time.monotonic() >= deadline:
                     _log(
                         {
                             "stored": False,
                             "mode": "abandoned_foreground_busy",
-                            "reason": "foreground_busy_past_deadline",
+                            "reason": "model_lock_busy_past_deadline",
                         }
                     )
                     return
-                time.sleep(_IDLE_POSTCOMMIT_POLL_INTERVAL_S)
 
-            # Foreground is idle. Run the canonical retokenized commit with a
-            # non-blocking lock acquire, so a foreground request that wins the
-            # race after the idle check is never delayed by background cache
-            # maintenance.
-            postcommit = _store_retokenized_history_snapshot(
-                state,
-                session_id=session_id,
-                messages=messages,
-                assistant_content=assistant_content,
-                assistant_tool_calls=assistant_tool_calls,
-                thinking_enabled=thinking_enabled,
-                policy_fingerprint=policy_fingerprint,
-                acquire_model_lock_blocking=False,
-            )
-            _log(postcommit)
+                time.sleep(_IDLE_POSTCOMMIT_POLL_INTERVAL_S)
         except BaseException as exc:
             _log(
                 {
