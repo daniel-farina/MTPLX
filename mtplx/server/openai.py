@@ -2226,22 +2226,17 @@ def _store_retokenized_history_snapshot(
 ) -> dict[str, Any]:
     if session_id is None:
         return {"stored": False, "reason": "no_session_id"}
-    history_messages = list(messages) + [
-        ChatMessage(
-            role="assistant",
-            content=assistant_content,
-            tool_calls=assistant_tool_calls,
-        ),
-    ]
-    encoded_with_sentinel = _encode_messages(
-        state.runtime.tokenizer,
-        history_messages,
-        enable_thinking=thinking_enabled,
-        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-        add_generation_prompt=False,
-        tools=tool_specs,
+    # Encode the history so it is a strict prefix of the next request's
+    # prompt (see _encode_history_for_storage docstring for why we cannot
+    # just append the assistant message and encode directly).
+    history_ids = _encode_history_for_storage(
+        state,
+        messages=messages,
+        assistant_content=assistant_content,
+        assistant_tool_calls=assistant_tool_calls,
+        thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
-    history_ids = encoded_with_sentinel
     if not history_ids:
         return {"stored": False, "reason": "empty_boundary_prefix"}
     started = time.perf_counter()
@@ -2329,6 +2324,74 @@ def _store_retokenized_history_snapshot(
     }
 
 
+_IM_START_TOKEN = "<|im_start|>"
+
+
+def _encode_history_for_storage(
+    state: ServerState,
+    *,
+    messages: list[ChatMessage],
+    assistant_content: str,
+    assistant_tool_calls: list[dict[str, Any]] | None,
+    thinking_enabled: bool,
+    tool_specs: list[dict[str, Any]] | None = None,
+) -> list[int]:
+    """Encode history up to and including the assistant turn so the result
+    is a strict prefix of the next request's prompt encoding.
+
+    Without this trick, the Qwen3 chat template injects an empty
+    `<think>\\n\\n</think>\\n\\n` block before tool_call markup when an
+    assistant message is the trailing message AND `enable_thinking=False`.
+    The next request's prompt has the assistant message followed by
+    tool_result + user_msg, so that injection does NOT happen at lookup
+    time. Storage therefore needs to render the assistant in a
+    "non-trailing" position to match.
+
+    Approach: append a sentinel user message, encode, truncate the result
+    before the LAST `<|im_start|>` token (where the sentinel begins). The
+    kept prefix ends cleanly at `<|im_end|>\\n` after the assistant turn
+    and is a strict prefix of any request that follows the assistant with
+    another message of any role - which is exactly what the
+    SessionBank.longest_prefix lookup needs.
+    """
+    history_messages = list(messages) + [
+        ChatMessage(
+            role="assistant",
+            content=assistant_content,
+            tool_calls=assistant_tool_calls,
+        ),
+        ChatMessage(role="user", content="_"),
+    ]
+    encoded = _encode_messages(
+        state.runtime.tokenizer,
+        history_messages,
+        enable_thinking=thinking_enabled,
+        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
+        add_generation_prompt=False,
+        tools=tool_specs,
+    )
+    if not encoded:
+        return []
+    try:
+        im_start_id = state.runtime.tokenizer.convert_tokens_to_ids(
+            _IM_START_TOKEN
+        )
+    except Exception:
+        im_start_id = None
+    if im_start_id is None or not isinstance(im_start_id, int) or im_start_id < 0:
+        # Tokenizer doesn't expose <|im_start|>: best-effort, return raw.
+        # Truncating heuristically would risk corrupting the prefix.
+        return list(encoded)
+    last_im_start = -1
+    for i in range(len(encoded) - 1, -1, -1):
+        if encoded[i] == im_start_id:
+            last_im_start = i
+            break
+    if last_im_start < 0:
+        return list(encoded)
+    return list(encoded[:last_im_start])
+
+
 def _history_ids_for_postcommit(
     state: ServerState,
     *,
@@ -2338,20 +2401,13 @@ def _history_ids_for_postcommit(
     thinking_enabled: bool,
     tool_specs: list[dict[str, Any]] | None = None,
 ) -> list[int]:
-    history_messages = list(messages) + [
-        ChatMessage(
-            role="assistant",
-            content=assistant_content,
-            tool_calls=assistant_tool_calls,
-        ),
-    ]
-    return _encode_messages(
-        state.runtime.tokenizer,
-        history_messages,
-        enable_thinking=thinking_enabled,
-        strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
-        add_generation_prompt=False,
-        tools=tool_specs,
+    return _encode_history_for_storage(
+        state,
+        messages=messages,
+        assistant_content=assistant_content,
+        assistant_tool_calls=assistant_tool_calls,
+        thinking_enabled=thinking_enabled,
+        tool_specs=tool_specs,
     )
 
 
