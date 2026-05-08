@@ -1646,12 +1646,28 @@ class VllmMetalPagedKVCache:
         if partitioned_enabled and int(self.offset) >= partition_threshold:
             return run_partitioned_paged(force_fp32_paged=force_fp32_paged)
         out = mx.array(0)
-        # Note: this default vllm_metal path requires the external ops by
-        # design (no in-tree alternative for the bare paged_attention_primitive
-        # call). The graceful-fallback paths are turboquant + the
-        # mlx_vector_paged / sdpa_2pass_paged / fast_sdpa_gather IMPLs which
-        # have packaged kernels above. Production callers select an IMPL.
-        _load_vllm_metal_ops().paged_attention_primitive(
+        # The bare vllm_metal default path needs external ops. If they aren't
+        # available (no nanobind, no JIT-built paged_ops.so, no
+        # MTPLX_VLLM_METAL_REPO), fall through to the in-tree split-sdpa
+        # fallback used by the partitioned/turboquant paths so the request
+        # does not crash mid-stream. Operators who want the optimal kernel
+        # install nanobind + run vllm_metal/metal/build.py.
+        ops = _load_vllm_metal_ops_optional(
+            context="vllm_metal default paged_attention"
+        )
+        if ops is None:
+            split_out = self._large_q_split_sdpa_fallback(
+                queries,
+                scale=scale,
+                sliding_window=int(sliding_window),
+                mask=mask,
+            )
+            if split_out is not None:
+                self.paged_attention_calls += 1
+                self.attention_time_s += time.perf_counter() - started
+                return split_out
+            return bailout("vllm_metal_ops_unavailable")
+        ops.paged_attention_primitive(
             q_3d,
             kernel_key_cache,
             kernel_value_cache,
