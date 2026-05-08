@@ -334,7 +334,10 @@ class SessionBank:
         for prefix, entry in self._entries.items():
             if session_id is not None and entry.session_id != session_id:
                 continue
-            n = min(len(prefix), len(lookup_tokens), 300)
+            # Scan the FULL overlapping range to find the actual divergence
+            # point. Without this, a divergence beyond the dump head window
+            # (300 tokens) shows as first_diff=-1 and we can't locate it.
+            n = min(len(prefix), len(lookup_tokens))
             first_diff = -1
             for i in range(n):
                 if prefix[i] != lookup_tokens[i]:
@@ -342,18 +345,43 @@ class SessionBank:
                     break
             if first_diff < 0 and len(prefix) > len(lookup_tokens):
                 first_diff = len(lookup_tokens)
+            # If we found a real divergence, sample a window around it so we
+            # can decode the exact bytes that differ. Otherwise sample the
+            # head as before.
+            if first_diff >= 0:
+                lo = max(0, first_diff - 100)
+                stored_window_lo = lo
+                stored_window = list(prefix[lo:min(len(prefix), first_diff + 100)])
+            else:
+                stored_window_lo = 0
+                stored_window = list(prefix[:300])
             candidates.append({
                 "stored_len": len(prefix),
                 "stored_session_id": entry.session_id,
                 "first_divergence_at": first_diff,
+                "stored_window_offset": stored_window_lo,
+                "stored_window": stored_window,
                 "stored_head": list(prefix[:300]),
                 "stored_tail": list(prefix[-100:]) if len(prefix) > 100 else None,
             })
+        # Lookup window centered on the smallest first_diff we found, so
+        # comparison against stored_window yields the exact divergent bytes.
+        real_diffs = [c["first_divergence_at"] for c in candidates if c["first_divergence_at"] >= 0]
+        if real_diffs:
+            anchor = min(real_diffs)
+            lo = max(0, anchor - 100)
+            lookup_window_lo = lo
+            lookup_window = list(lookup_tokens[lo:min(len(lookup_tokens), anchor + 100)])
+        else:
+            lookup_window_lo = 0
+            lookup_window = list(lookup_tokens[:300])
         try:
             with open(path, "w") as f:
                 _json.dump({
                     "session_id": session_id,
                     "lookup_len": len(lookup_tokens),
+                    "lookup_window_offset": lookup_window_lo,
+                    "lookup_window": lookup_window,
                     "lookup_head": list(lookup_tokens[:300]),
                     "lookup_tail": list(lookup_tokens[-100:]) if len(lookup_tokens) > 100 else None,
                     "stored_entries": candidates,
