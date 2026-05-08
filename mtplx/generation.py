@@ -1283,6 +1283,7 @@ def restore_or_prefill_prompt_state(
     template_hash: str | None = None,
     draft_head_identity: str | None = None,
     policy_fingerprint: str | None = None,
+    session_id: str | None = None,
 ) -> PromptState:
     """Build the initial prompt state used by MTP-k decode.
 
@@ -1310,6 +1311,7 @@ def restore_or_prefill_prompt_state(
             mtp_history_policy=mtp_history_policy,
             draft_head_identity=draft_head_identity,
             policy_fingerprint=policy_fingerprint,
+            session_id=session_id,
         )
         if restored is not None and (
             not _mtp_history_uses_committed_cache(mtp_history_policy)
@@ -2864,6 +2866,7 @@ def generate_mtpk(
     session_template_hash: str | None = None,
     session_draft_head_identity: str | None = None,
     session_policy_fingerprint: str | None = None,
+    session_id: str | None = None,
     capture_final_state: bool = False,
     trace_label: str | None = None,
     trace_metadata: dict[str, Any] | None = None,
@@ -2964,6 +2967,7 @@ def generate_mtpk(
         template_hash=session_template_hash,
         draft_head_identity=session_draft_head_identity,
         policy_fingerprint=session_policy_fingerprint,
+        session_id=session_id,
     )
     cache = prompt_state.trunk_cache
     logits = prompt_state.logits
