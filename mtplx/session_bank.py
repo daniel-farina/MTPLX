@@ -373,6 +373,7 @@ class SessionBank:
         mtp_history_policy: str | None = None,
         draft_head_identity: str | None = None,
         policy_fingerprint: str | None = None,
+        session_id: str | None = None,
     ) -> SessionBankRestore | None:
         mode = str(mode).replace("-", "_")
         if mode == "reference_lease":
@@ -381,13 +382,25 @@ class SessionBank:
             raise ValueError("mode must be 'clone', 'reference', or 'reference_lease'")
         self.last_miss_reason = None
         self._purge_expired()
-        entry = self.longest_prefix(token_ids)
+        entry = self.longest_prefix(token_ids, session_id=session_id)
         if entry is None:
-            self.last_miss_reason = (
-                CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
-                if self._entries
-                else CacheMissReason.NEW_SESSION.value
+            # Distinguish "no entries from THIS session" (true new_session)
+            # from "entries from this session exist but lookup tokens diverge"
+            # (true prefix divergence). The session-scoped check below is what
+            # makes the miss reason actually meaningful: cross-session entries
+            # in the global bank no longer falsely trip prefix_divergence.
+            same_session_present = (
+                session_id is not None
+                and any(
+                    e.session_id == session_id for e in self._entries.values()
+                )
             )
+            if same_session_present or (session_id is None and self._entries):
+                self.last_miss_reason = (
+                    CacheMissReason.PREFIX_DIVERGENCE_AT_TOKEN.value
+                )
+            else:
+                self.last_miss_reason = CacheMissReason.NEW_SESSION.value
             return None
         if entry.model_path != str(runtime.model_path):
             self.last_miss_reason = CacheMissReason.MODEL_MISMATCH.value
