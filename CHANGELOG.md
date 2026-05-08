@@ -60,6 +60,24 @@ All notable user-facing changes are recorded here.
   and the async idle postcommit. The stored snapshot now reproduces the
   exact prefix the next request will send, so subsequent turns of a
   tool-using session reach the cached entry instead of cold-prefilling.
+- Fixed cross-thread MLX state issue when a SessionBank entry committed by
+  the async idle postcommit was later restored on a foreground request.
+  PR #17 (v0.2.0) introduced a dedicated `postcommit_executor` thread to
+  keep snapshot work off the foreground latency path, but MLX streams on
+  Apple Silicon are thread-local: a cache buffer created on the
+  postcommit thread cannot be read from the generation thread, so the
+  restore raised `RuntimeError: There is no Stream(gpu, N) in current
+  thread` and the response failed with HTTP 500. The bug was latent
+  through v0.2.0 because prefix divergence (see prior entry) was masking
+  every cache hit; once the prefix-divergence fix made lookups succeed,
+  every cache restore crashed. The async postcommit now submits to
+  `state.generation_executor` (matching v0.1.6 behaviour, which did not
+  have this issue) so cache buffers are created on the same thread that
+  will later restore them. The non-blocking lock acquire inside
+  `_store_retokenized_history_snapshot` already ensures the postcommit
+  yields when foreground actually wants the lock, so queueing on
+  `generation_executor` does not introduce foreground latency in
+  practice.
 
 ## v0.2.0
 

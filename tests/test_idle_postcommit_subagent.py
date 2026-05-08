@@ -39,7 +39,7 @@ def _fake_subagent_state(*, foreground_always: bool = False):
     return SimpleNamespace(
         lock=foreground_lock,
         has_foreground=has_foreground,
-        postcommit_executor=ThreadPoolExecutor(max_workers=1),
+        generation_executor=ThreadPoolExecutor(max_workers=1),
         # Console disabled so `_log` exercises the print branch (and stays
         # silent under pytest's captured stdout).
         args=SimpleNamespace(server_console=False),
@@ -52,7 +52,7 @@ def _wait_for_executor_drain(state, *, timeout_s: float = 5.0) -> None:
     Using `executor.shutdown(wait=True)` gives us a deterministic point
     after which `_log` has already been called for the submitted job.
     """
-    state.postcommit_executor.shutdown(wait=True)
+    state.generation_executor.shutdown(wait=True)
     _ = timeout_s  # symmetric with similar helpers; kept for readability.
 
 

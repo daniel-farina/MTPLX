@@ -2639,10 +2639,17 @@ def _schedule_idle_postcommit_snapshot(
                 }
             )
 
-    executor = getattr(state, "postcommit_executor", None)
-    if executor is None:
-        executor = state.generation_executor
-    executor.submit(async_postcommit)
+    # Route through generation_executor instead of a separate postcommit
+    # thread. MLX streams on Apple Silicon are thread-local, so a SessionBank
+    # entry created on one thread cannot be restored from another - the
+    # restore path raises "There is no Stream(gpu, N) in current thread".
+    # PR #17 introduced a dedicated postcommit_executor to keep this work off
+    # the foreground latency path, but in practice the non-blocking lock
+    # acquire inside _store_retokenized_history_snapshot already guarantees
+    # the postcommit yields when foreground actually wants to run, and
+    # queueing on generation_executor is the v0.1.6 behaviour that did not
+    # have this cross-thread issue.
+    state.generation_executor.submit(async_postcommit)
     return pending
 
 

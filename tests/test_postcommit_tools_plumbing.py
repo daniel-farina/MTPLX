@@ -387,7 +387,7 @@ def test_idle_postcommit_async_path_forwards_tool_specs(monkeypatch):
         unsafe_reason="retokenized_history_mismatch",
         tool_specs=_TOOL_SPECS,
     )
-    state.postcommit_executor.shutdown(wait=True)
+    state.generation_executor.shutdown(wait=True)
 
     assert pending["mode"] == "async_pending"
     assert len(captured) == 1
@@ -423,6 +423,6 @@ def test_idle_postcommit_default_tool_specs_is_none(monkeypatch):
         policy_fingerprint="policy",
         unsafe_reason="retokenized_history_mismatch",
     )
-    state.postcommit_executor.shutdown(wait=True)
+    state.generation_executor.shutdown(wait=True)
 
     assert captured and captured[0]["tool_specs"] is None
