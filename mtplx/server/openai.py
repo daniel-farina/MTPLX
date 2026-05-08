@@ -2325,6 +2325,7 @@ def _store_retokenized_history_snapshot(
         "cache_hit": bool(getattr(prompt_state, "cache_hit", False)),
         "cached_tokens": int(getattr(prompt_state, "cached_tokens", 0) or 0),
         "suffix_tokens": int(getattr(prompt_state, "suffix_tokens", 0) or 0),
+        "cache_miss_reason": getattr(prompt_state, "cache_miss_reason", None),
     }
 
 

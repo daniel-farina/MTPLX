@@ -333,8 +333,14 @@ def test_retokenized_snapshot_passes_session_bank_for_prefix_reuse(monkeypatch):
     assert captured_kwargs.get("template_hash") == "tmpl-hash"
     assert captured_kwargs.get("draft_head_identity") == "draft-id"
     assert captured_kwargs.get("policy_fingerprint") == "policy-fp"
-    # cache_hit / cached_tokens / suffix_tokens propagate to result for
-    # observability.
+    # cache_hit / cached_tokens / suffix_tokens / cache_miss_reason
+    # propagate to result for observability. The miss reason is the bank's
+    # `last_miss_reason` after this turn's lookup; on a true hit it is
+    # None, otherwise it captures why the prefix shortcut could not run
+    # (`new_session`, `prefix_divergence_at_token`, `policy_mismatch`,
+    # ...). Operators rely on this field to debug regressions where the
+    # postcommit silently falls back to a full re-prefill.
     assert result["cache_hit"] is True
     assert result["cached_tokens"] == 17_500
     assert result["suffix_tokens"] == 320
+    assert "cache_miss_reason" in result
