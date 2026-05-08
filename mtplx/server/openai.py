@@ -2350,6 +2350,7 @@ def _store_retokenized_history_snapshot(
                 template_hash=state.template_hash,
                 draft_head_identity=state.draft_head_identity,
                 policy_fingerprint=policy_fingerprint,
+                session_id=session_id,
             )
         mtp_snapshot = (
             snapshot_cache(prompt_state.committed_mtp_cache)
@@ -3073,6 +3074,7 @@ def _run_generation(
                         session_template_hash=session_template_hash,
                         session_draft_head_identity=session_draft_head_identity,
                         session_policy_fingerprint=session_policy_fingerprint,
+                        session_id=session_id,
                         capture_final_state=session_bank is not None,
                         trace_label=trace_label,
                         trace_metadata=trace_metadata,
