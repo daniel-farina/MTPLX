@@ -504,7 +504,90 @@ def _startup_heartbeat(label: str, *, interval_s: float = 10.0) -> _StartupHeart
     return _StartupHeartbeat(label, interval_s=interval_s)
 
 
-def _apply_metal_memory_caps() -> dict[str, Any]:
+def _parse_metal_memory_size_bytes(raw: str | int | None, default_bytes: int) -> int:
+    text = str(raw or "").strip().upper().replace("_", "")
+    if not text:
+        return int(default_bytes)
+    suffix_map = {
+        "K": 1024,
+        "KB": 1024,
+        "M": 1024**2,
+        "MB": 1024**2,
+        "G": 1024**3,
+        "GB": 1024**3,
+        "T": 1024**4,
+        "TB": 1024**4,
+    }
+    for suffix, multiplier in sorted(
+        suffix_map.items(), key=lambda item: -len(item[0])
+    ):
+        if text.endswith(suffix):
+            try:
+                return max(1, int(float(text[: -len(suffix)]) * multiplier))
+            except (TypeError, ValueError):
+                return int(default_bytes)
+    try:
+        return max(1, int(float(text)))
+    except (TypeError, ValueError):
+        return int(default_bytes)
+
+
+def _detect_total_ram_bytes_for_metal_caps() -> tuple[int | None, str]:
+    try:
+        import psutil
+    except ImportError:
+        psutil = None
+    if psutil is not None:
+        try:
+            total = int(psutil.virtual_memory().total)
+            if total > 0:
+                return total, "psutil"
+        except Exception:
+            pass
+    if sys.platform == "darwin":
+        try:
+            output = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+            total = int(str(output).strip())
+            if total > 0:
+                return total, "sysctl_hw_memsize"
+        except Exception:
+            pass
+    return None, "unknown"
+
+
+def _metal_is_available(mx: Any) -> bool:
+    metal = getattr(mx, "metal", None)
+    is_available = getattr(metal, "is_available", None)
+    if callable(is_available):
+        try:
+            return bool(is_available())
+        except Exception:
+            return False
+    return metal is not None
+
+
+def _set_metal_memory_limit(mx: Any, name: str, value: int) -> str:
+    top_level = getattr(mx, name, None)
+    if callable(top_level):
+        top_level(int(value))
+        return f"mx.{name}"
+    metal = getattr(mx, "metal", None)
+    metal_level = getattr(metal, name, None)
+    if callable(metal_level):
+        metal_level(int(value))
+        return f"mx.metal.{name}"
+    raise AttributeError(f"MLX memory cap API {name} is unavailable")
+
+
+def _apply_metal_memory_caps(
+    *,
+    mx_module: Any | None = None,
+    total_ram_bytes: int | None = None,
+) -> dict[str, Any]:
     """Pin MLX Metal allocator caps at startup to avoid wired-memory swap-out
     pathologies under sustained long-context inference.
 
@@ -520,59 +603,64 @@ def _apply_metal_memory_caps() -> dict[str, Any]:
 
     Both accept plain bytes or K/M/G/T suffix.
     """
-    import mlx.core as mx
-    if not mx.metal.is_available():
+    if mx_module is None:
+        try:
+            import mlx.core as mx
+        except Exception as exc:
+            return {
+                "applied": False,
+                "reason": "mlx_unavailable",
+                "error": repr(exc),
+            }
+    else:
+        mx = mx_module
+    if not _metal_is_available(mx):
         return {"applied": False, "reason": "metal_unavailable"}
-    try:
-        import psutil
-    except ImportError:
-        psutil = None
-    total_ram = 0
-    if psutil is not None:
-        try:
-            total_ram = int(psutil.virtual_memory().total)
-        except Exception:
-            total_ram = 0
+    if total_ram_bytes is None:
+        total_ram, total_ram_source = _detect_total_ram_bytes_for_metal_caps()
+    else:
+        total_ram = int(total_ram_bytes)
+        total_ram_source = "explicit"
+    mem_raw = os.environ.get("MTPLX_MEMORY_LIMIT_BYTES")
+    wired_raw = os.environ.get("MTPLX_WIRED_LIMIT_BYTES")
+    if total_ram is None or total_ram <= 0:
+        if not mem_raw and not wired_raw:
+            return {"applied": False, "reason": "ram_unknown"}
+        default_mem = 1
+        default_wired = 1
+    else:
+        default_mem = min(total_ram, max(8 * 1024**3, int(total_ram * 0.75)))
+        default_wired = min(default_mem, max(4 * 1024**3, int(total_ram * 0.60)))
+    mem_limit = _parse_metal_memory_size_bytes(mem_raw, default_mem)
+    wired_limit = _parse_metal_memory_size_bytes(wired_raw, default_wired)
 
-    def _parse_size(env_name: str, default_bytes: int) -> int:
-        raw = (os.environ.get(env_name) or "").strip().upper()
-        if not raw:
-            return default_bytes
-        suffix_map = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
-        if raw[-1] in suffix_map:
-            try:
-                return int(float(raw[:-1]) * suffix_map[raw[-1]])
-            except ValueError:
-                return default_bytes
-        try:
-            return int(raw)
-        except ValueError:
-            return default_bytes
-
-    default_mem = max(8 * 1024**3, int(total_ram * 0.75)) if total_ram else 96 * 1024**3
-    default_wired = max(4 * 1024**3, int(total_ram * 0.60)) if total_ram else 60 * 1024**3
-    mem_limit = _parse_size("MTPLX_MEMORY_LIMIT_BYTES", default_mem)
-    wired_limit = _parse_size("MTPLX_WIRED_LIMIT_BYTES", default_wired)
-
-    applied: dict[str, Any] = {"applied": True}
+    applied: dict[str, Any] = {
+        "applied": True,
+        "total_ram_bytes": total_ram,
+        "total_ram_source": total_ram_source,
+    }
+    if wired_limit > mem_limit:
+        wired_limit = mem_limit
+        applied["wired_limit_clamped_to_memory_limit"] = True
     # Prefer the new top-level mx.set_memory_limit / mx.set_wired_limit; fall
     # back to the deprecated mx.metal.* names if running on an older MLX.
     try:
-        if hasattr(mx, "set_memory_limit"):
-            mx.set_memory_limit(int(mem_limit))
-        else:
-            mx.metal.set_memory_limit(int(mem_limit))
+        applied["memory_limit_api"] = _set_metal_memory_limit(
+            mx, "set_memory_limit", int(mem_limit)
+        )
         applied["memory_limit_bytes"] = int(mem_limit)
     except Exception as exc:
         applied["memory_limit_error"] = str(exc)
     try:
-        if hasattr(mx, "set_wired_limit"):
-            mx.set_wired_limit(int(wired_limit))
-        else:
-            mx.metal.set_wired_limit(int(wired_limit))
+        applied["wired_limit_api"] = _set_metal_memory_limit(
+            mx, "set_wired_limit", int(wired_limit)
+        )
         applied["wired_limit_bytes"] = int(wired_limit)
     except Exception as exc:
         applied["wired_limit_error"] = str(exc)
+    if "memory_limit_bytes" not in applied and "wired_limit_bytes" not in applied:
+        applied["applied"] = False
+        applied["reason"] = "cap_api_unavailable"
     return applied
 
 
@@ -5045,6 +5133,11 @@ def _server_settings_payload(state: ServerState) -> dict[str, Any]:
         "generation_mode": state.args.generation_mode,
         "depth": state.args.depth,
         "model": state.model_id,
+        "metal_memory_caps": getattr(
+            state,
+            "metal_memory_caps",
+            {"applied": False, "reason": "unavailable"},
+        ),
     }
 
 
@@ -5444,6 +5537,11 @@ def create_app(state: ServerState) -> FastAPI:
             ),
             "live_output_detach": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS"),
             "live_output_detach_mode": os.environ.get("MTPLX_DETACH_LIVE_OUTPUTS_MODE"),
+            "metal_memory_caps": getattr(
+                state,
+                "metal_memory_caps",
+                {"applied": False, "reason": "unavailable"},
+            ),
             "mlx_cache_limit": state.mlx_cache_limit_status,
             "mlx_fork": state.mlx_fork_status,
         }
