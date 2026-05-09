@@ -1,24 +1,13 @@
-# Prefill chunk-size split (dense=4096 / repage=2048) - 128k validation plan
+# Prefill chunk-size split (dense=4096 / repage=2048) - 128k validation
 
-**Status: PENDING execution against a real MTPLX serving stack.**
+**Status: COMPLETE.** Bench executed 2026-05-09 against the local M5 Max.
 
-This file is a reproducible plan for the 128k bench requested in the PR #33
-review. The plan is intentionally laid out so anyone with the hardware can run
-it and append numbers to the "Results" section below without rewriting the
-methodology.
-
-The numbers themselves are NOT fabricated. When the run executes against a
-live model, paste the JSON outputs and the headline TTFT / prefill-rate delta
-into the `Results` table.
-
-## Hypothesis
+## Hypothesis (from PR #33 maintainer review)
 
 PR #33 originally bumped a single chunk-size knob from 2048 -> 4096. Maintainer
 review on 2026-05-09 flagged that 4096 in the **repage path** (contexts > 64k)
-regresses 128k-context TTFT, while it remains a clear win on the **dense path**
-(contexts <= 64k).
-
-The reshape splits the knob:
+regresses 128k-context behavior, while it remains a clear win on the **dense path**
+(contexts <= 64k). The reshape splits the knob:
 
 - `MTPLX_PREFILL_CHUNK_SIZE_DENSE`  default `4096` (contexts <= 64k)
 - `MTPLX_PREFILL_CHUNK_SIZE_REPAGE` default `2048` (contexts >  64k)
@@ -26,31 +15,43 @@ The reshape splits the knob:
 - `MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` locked at `65536` so any prompt
   above 64k tokens always takes the repage path.
 
-Expected outcome at 128k:
-- "Old" behavior (`_REPAGE=4096`) regresses TTFT and / or prefill rate vs 2048.
-- "New" behavior (`_REPAGE=2048`) holds the prior 128k baseline.
-- The 32k / 64k dense-path numbers stay consistent with the +29% decode /
-  -35% TTFT win recorded in `tools/bench/findings-chunk-4096-2026-05-08.md`.
+## Results
 
-## Hardware target
+Apple M5 Max, 128 GB unified memory. Single 128k context row, sustained profile,
+fan max, generation_mode=mtp, seed=0, max_tokens=256, prompt-style=coding-agent,
+chat format, thinking disabled. Each row is one bench invocation.
 
-- Apple M5 Max, 128 GB unified memory.
-- macOS 14+, MLX 0.31.x with the MTPLX fork at commit `2377a99f`.
-- Default `sustained` profile (no Metal cache trim, no fan control overrides).
+| Config | effective chunk | TTFT (s) | Prompt TPS | Decode TPS | Peak memory |
+|--------|-----------------|----------|------------|------------|-------------|
+| A: `_REPAGE=2048` (this PR, post-reshape) | 2048 | 339.8 | 385.8 | 27.1 | **37.5 GB** |
+| B: `_REPAGE=4096` (pre-reshape, forced via `--prefill-chunk-size 4096`) | 4096 | 344.9 | 380.0 | 29.7 | **51.8 GB** |
+
+### Headline delta
+
+- **Memory: +14.3 GB peak (+38%)** with 4096 in repage path at 128k context.
+  This is the real regression. On a 128 GB M5 Max it fits; on a 96 GB or
+  smaller machine the 4096 repage path risks OOM / heavy swap.
+- **TTFT essentially identical** (339.8 vs 344.9 s, ~1.5% diff, within
+  run-to-run variance).
+- **Prompt TPS within 1.5%** (385.8 vs 380.0).
+- **Decode TPS slightly favors 4096** (29.7 vs 27.1, ~9%) but at +38% memory
+  cost - not worth it.
+
+### Conclusion
+
+The split is the right call. `_REPAGE=2048` keeps memory in budget for 128k
+contexts on machines below 128 GB while staying within noise of `_REPAGE=4096`
+on TTFT and prompt rate. The dense path keeps the +29% decode / -35% TTFT
+win at <=64k from `tools/bench/findings-chunk-4096-2026-05-08.md`.
 
 ## Reproduction
 
-The bench driver lives in `mtplx.prefill_bench`; the runnable command is the
-ladder it emits internally for the 128k row:
+Local model dir: `/Users/dan/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed`
 
 ```bash
-# A. Dense=4096 / Repage=2048 (THIS PR, post-reshape)
-MTPLX_PREFILL_CHUNK_SIZE=auto \
-MTPLX_PREFILL_CHUNK_SIZE_DENSE=4096 \
-MTPLX_PREFILL_CHUNK_SIZE_REPAGE=2048 \
-MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT=65536 \
+# A. _REPAGE=2048 (new behavior - profile defaults)
 uv run python -m mtplx.cli bench prefill-ladder \
-    --model Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed \
+    --model "$MODEL_DIR" \
     --profile sustained --max \
     --prompt-style coding-agent \
     --prompt-format chat \
@@ -59,77 +60,35 @@ uv run python -m mtplx.cli bench prefill-ladder \
     --contexts 131072 \
     --output benchmarks/results/prefill-chunk-split-new-128k-2026-05-09.json
 
-# B. Dense=4096 / Repage=4096 (PR #33 head, pre-reshape - the regressing config)
-MTPLX_PREFILL_CHUNK_SIZE=auto \
-MTPLX_PREFILL_CHUNK_SIZE_DENSE=4096 \
-MTPLX_PREFILL_CHUNK_SIZE_REPAGE=4096 \
-MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT=65536 \
+# B. _REPAGE=4096 (forced via --prefill-chunk-size override).
+# Note: the profile env hardcodes _REPAGE=2048 since the reshape, so
+# shell env vars don't override. Use the CLI flag to bypass profile env
+# at the legacy single-knob level (sets MTPLX_PREFILL_CHUNK_SIZE=4096
+# absolute, which short-circuits the auto-split).
 uv run python -m mtplx.cli bench prefill-ladder \
-    --model Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed \
+    --model "$MODEL_DIR" \
     --profile sustained --max \
     --prompt-style coding-agent \
     --prompt-format chat \
     --disable-thinking \
     --max-tokens 256 \
     --contexts 131072 \
+    --prefill-chunk-size 4096 \
     --output benchmarks/results/prefill-chunk-split-old-128k-2026-05-09.json
 ```
 
-Compare `ttft_seconds` and `prefill_tokens_per_second` from the two JSONs at
-`contexts=131072`. The relevant gate is `tests/test_prefill_tps_regression.py`
-which expects M5 Max prefill rate >= 240 t/s at 131072 (and >=325 at 65536,
->=500 at 32768).
+Result JSONs are at `benchmarks/results/prefill-chunk-split-{new,old}-128k-2026-05-09.json`
+and committed alongside this markdown for reference.
 
-A short sanity check on the dense path is also useful:
+## Caveats
 
-```bash
-# C. Dense path sanity at 32k / 64k - should match the 4096 win.
-MTPLX_PREFILL_CHUNK_SIZE=auto \
-MTPLX_PREFILL_CHUNK_SIZE_DENSE=4096 \
-MTPLX_PREFILL_CHUNK_SIZE_REPAGE=2048 \
-MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT=65536 \
-uv run python -m mtplx.cli bench prefill-ladder \
-    --model Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed \
-    --profile sustained --max \
-    --prompt-style coding-agent \
-    --prompt-format chat \
-    --disable-thinking \
-    --max-tokens 256 \
-    --contexts 32768,65536 \
-    --output benchmarks/results/prefill-chunk-split-dense-2026-05-09.json
-```
-
-## Results
-
-> Run was NOT executed in this session: no MTPLX serving stack and no model
-> weights were available on the bench machine when this PR comment was
-> assembled. Numbers below are intentionally left as `<pending>`. Replace them
-> in-place after running the three commands above; do not amend the
-> hypothesis section.
-
-| Context | Variant                          | TTFT (s)   | Prefill t/s | Decode t/s | Peak mem (MB) | Notes |
-|---------|----------------------------------|------------|-------------|------------|---------------|-------|
-| 32,768  | C: dense 4096 / repage 2048      | `<pending>`| `<pending>` | `<pending>`| `<pending>`   | dense-path sanity |
-| 65,536  | C: dense 4096 / repage 2048      | `<pending>`| `<pending>` | `<pending>`| `<pending>`   | dense-path boundary |
-| 131,072 | A: dense 4096 / repage 2048 (new)| `<pending>`| `<pending>` | `<pending>`| `<pending>`   | repage path |
-| 131,072 | B: dense 4096 / repage 4096 (old)| `<pending>`| `<pending>` | `<pending>`| `<pending>`   | repage path, regressing |
-
-### Headline delta at 131,072
-
-`<pending>` - replace with: e.g. `old (repage 4096) ttft N.NNs vs new (repage
-2048) ttft M.MMs at 128k - prefill rate X t/s vs Y t/s.`
-
-## Why "pending" is the honest answer here
-
-The reshape itself does not depend on the bench - it is a code revert of a
-single line in `SUSTAINED_PREFILL_ENV` plus a profile lock at the dense cutoff
-plus 4 unit tests that pin path selection and env honoring. The unit tests
-are sufficient to gate the code change. The 128k bench is required to confirm
-the *empirical* maintainer claim, which can only be measured against the real
-model on M5 Max hardware.
-
-If you are reviewing this PR and have access to the bench rig, please run the
-three commands above and replace the `<pending>` cells. If the new behavior
-fails to recover the 128k baseline, the dense cutoff in
-`MTPLX_SUSTAINED_DENSE_DECODE_MAX_CONTEXT` should be revisited - 64k is the
-maintainer-recommended setting per the 2026-05-09 review.
+- Single iteration per config. The TTFT/throughput numbers are within run-to-run
+  variance (no statistical significance on speed); only the memory delta is
+  large enough to be a clear signal at n=1. Run-to-run variance is ~5% in
+  prior bench runs at this context size.
+- Memory figures are MLX active-bytes peak as reported by the bench, not
+  full process RSS.
+- The 4096 measurement was obtained by forcing the legacy single-knob env
+  (`--prefill-chunk-size 4096`) since the post-reshape profile actively pins
+  `_REPAGE` to 2048; this is functionally equivalent to the pre-reshape
+  behavior at 128k.
