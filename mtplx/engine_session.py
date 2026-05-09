@@ -8,6 +8,7 @@ state explicit before the generation loop accepts warm prompt state directly.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import time
 from contextlib import contextmanager
@@ -22,6 +23,15 @@ from .session_bank import (
     DEFAULT_PER_SESSION_MAX_BYTES,
     SessionBank,
 )
+
+
+logger = logging.getLogger(__name__)
+
+
+# Mirrors SessionBank.__init__'s hardcoded max_entries default (kept in sync
+# manually so the operator override here does not silently shift the default
+# for callers that construct SessionBank directly).
+_DEFAULT_BANK_MAX_ENTRIES = 8
 
 
 def _bank_bytes_from_env(name: str, default: int) -> int:
@@ -46,6 +56,37 @@ def _bank_bytes_from_env(name: str, default: int) -> int:
     except (OverflowError, ValueError, IndexError):
         return default
     if value < 1:
+        return default
+    return value
+
+
+def _bank_entries_from_env(name: str, default: int) -> int:
+    """Read a SessionBank entry-count override from the environment.
+
+    Parses a plain integer (no K/M/G/T suffixes - entry count is a count, not
+    a byte size). Validates that the value is >= 1. On parse error or invalid
+    value, logs a warning and returns the default.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        logger.warning(
+            "Invalid %s=%r (expected integer >= 1); falling back to default %d",
+            name,
+            raw,
+            default,
+        )
+        return default
+    if value < 1:
+        logger.warning(
+            "Invalid %s=%r (must be >= 1); falling back to default %d",
+            name,
+            raw,
+            default,
+        )
         return default
     return value
 
@@ -471,8 +512,14 @@ class EngineSessionManager:
         # Bank caps default to the constants in session_bank.py. Operators
         # running into per-session eviction at large contexts can override
         # via MTPLX_SESSION_BANK_PER_SESSION_BYTES (e.g. "16G" for 16 GiB)
-        # or MTPLX_SESSION_BANK_MAX_BYTES.
+        # or MTPLX_SESSION_BANK_MAX_BYTES. The entry-count cap is also
+        # overridable via MTPLX_SESSION_BANK_MAX_ENTRIES (plain integer)
+        # for workloads where ~2 GB-per-entry contexts make the default of
+        # 8 the binding constraint well before the byte caps.
         self.bank = bank or SessionBank(
+            max_entries=_bank_entries_from_env(
+                "MTPLX_SESSION_BANK_MAX_ENTRIES", _DEFAULT_BANK_MAX_ENTRIES
+            ),
             max_bytes=_bank_bytes_from_env(
                 "MTPLX_SESSION_BANK_MAX_BYTES", DEFAULT_MAX_BYTES
             ),
