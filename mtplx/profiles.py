@@ -404,11 +404,24 @@ def apply_profile_env(
     *,
     environ: MutableMapping[str, str] | None = None,
 ) -> dict[str, str | None]:
+    """Apply ``name``'s profile env, but treat the profile values as
+    defaults: if the caller already has the env var set in ``target``,
+    keep their value.
+
+    The previous behavior blindly overwrote any user-provided env var
+    with the profile's value at startup. That silently erases every
+    documented escape hatch (``MTPLX_MTP_HISTORY_POLICY=committed``,
+    ``MTPLX_VLLM_METAL_PAGED_TURBOQUANT=1``, etc.), so users were
+    running with profile defaults regardless of what they exported.
+    Profile values should be defaults, not overrides.
+    """
     target = os.environ if environ is None else environ
     profile = get_profile(name)
     previous = {key: target.get(key) for key in profile.env_dict()}
     for key, value in profile.env:
-        target[key] = value
+        existing = target.get(key)
+        if existing is None or not str(existing).strip():
+            target[key] = value
     return previous
 
 
