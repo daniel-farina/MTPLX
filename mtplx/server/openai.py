@@ -799,6 +799,7 @@ class ServerState:
             else _resolve_context_window(self.runtime.tokenizer, args.model)
         )
         _startup_line(f"[5/6] Context window: {self.context_window} tokens")
+        _autotune_turboquant_for_context(self.context_window)
         self.sessions = EngineSessionManager()
         self.last_metrics: list[dict[str, Any]] = []
         # Activity timestamps used by the parent-process thermal watchdog to
@@ -936,6 +937,38 @@ class _RateLimiter:
             events.append(timestamp)
             self._events[key] = events
             return True, 0
+
+
+def _autotune_turboquant_for_context(context_window: int) -> None:
+    """Pick a TurboQuant V-quant default based on the configured context
+    window when the user hasn't explicitly set one.
+
+    The TurboQuant paper (arXiv:2504.19874 Section 4.2/4.3) reports
+    "absolute quality neutrality with 3.5 bits per channel" - so 3-bit
+    V-quant is below the cliff and quality drifts at long context.
+    For a server configured with a >16K window, the user clearly intends
+    long-context use, so q5_0 V is the right starting point. For shorter
+    windows the memory savings of q3_0 is fine.
+
+    Only fires when the user hasn't pinned _V_QUANT explicitly. Profile
+    defaults still take precedence over any auto-tune; this just fills
+    the gap when a custom invocation didn't set anything.
+    """
+    if not _autotune_should_set("MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"):
+        return
+    threshold = 16_384
+    target = "q5_0" if int(context_window) > threshold else "q3_0"
+    os.environ["MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT"] = target
+    _startup_line(
+        f"[5/6] TurboQuant V-quant auto-tuned to {target} for context_window={context_window} (threshold={threshold})"
+    )
+
+
+def _autotune_should_set(env_name: str) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None:
+        return True
+    return not raw.strip()
 
 
 def _resolve_context_window(tokenizer: Any, model_path: str) -> int:
