@@ -60,20 +60,25 @@ def _mtp_history_policy_compatible(
     """Return True if a bank entry stored under ``entry_policy`` may be reused
     for a lookup that resolved to ``lookup_policy``.
 
-    Equality is always compatible. Beyond that, ``committed`` and
-    ``last_window`` are treated as interchangeable because both rely on the
-    same committed mtp-history cache shape; the only difference between them
-    is a runtime trim that is applied during prefill, which is moot once the
-    cache is being restored from a stored snapshot.
+    Equality is always compatible. Cross-policy reuse between ``committed``
+    and ``last_window`` was previously allowed on the theory that both share
+    the same committed mtp-history cache shape and the trim is a no-op once
+    we restore from snapshot. In practice the warm-restore path in
+    ``generation.py`` calls ``_append_mtp_history(suffix)`` WITHOUT
+    ``position_offset``, while the cold-prefill path passes it. When a
+    ``committed``-stored entry is reused by a ``last_window`` lookup, the
+    suffix tokens get appended with offset 0 instead of the
+    ``token_start_index``-based offset, and M-RoPE positions on the draft
+    head drift from the trunk. The verifier then accepts plausibly-shaped
+    garbage drafts and the model emits hallucinated training-data fragments
+    mid-stream above the ``..._WINDOW_THRESHOLD`` (16384 tokens).
+
+    Conservative fix until ``_append_mtp_history`` is fixed to take
+    ``position_offset`` on the warm-restore path: require an exact policy
+    match. Cross-policy lookups force a cold prefill, which is slower but
+    correct.
     """
-    if entry_policy == lookup_policy:
-        return True
-    if entry_policy is None or lookup_policy is None:
-        return False
-    return (
-        entry_policy in _COMMITTED_CACHE_POLICIES
-        and lookup_policy in _COMMITTED_CACHE_POLICIES
-    )
+    return entry_policy == lookup_policy
 
 
 def _tree_nbytes(value: Any) -> int:
