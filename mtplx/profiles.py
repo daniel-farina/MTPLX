@@ -101,6 +101,18 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_VLLM_METAL_PAGED_PARTITION_THRESHOLD": "2048",
     "MTPLX_VLLM_METAL_PAGED_PARTITION_SIZE": "512",
     "MTPLX_VLLM_METAL_PAGED_TURBOQUANT": "0",
+    # When TurboQuant is enabled, default V-quant to 5-bit instead of 3-bit.
+    # The 3-bit Lloyd-Max default sits *below* the TurboQuant paper's
+    # 3.5-bpw "absolute quality neutrality" threshold (arXiv:2504.19874
+    # Section 4.2/4.3), so quality drifts at long context - exactly the
+    # use case the sustained profile is meant to target. Empirically,
+    # 27K-context coding-agent runs with K=q8_0 / V=q3_0 produced
+    # malformed tool_call payloads and silent hallucination, while the
+    # same task on the same model with V=q5_0 landed correct edits and
+    # passed the build. q5_0 is still ~2x smaller than full bf16 for
+    # values, so the memory cost of the bump is small.
+    "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_K_QUANT": "q8_0",
+    "MTPLX_VLLM_METAL_PAGED_TURBOQUANT_V_QUANT": "q5_0",
     "MTPLX_CLEAR_CACHE_EVERY": "auto",
     "MTPLX_CLEAR_CACHE_EVERY_CONTEXT_THRESHOLD": "16384",
     "MTPLX_CLEAR_CACHE_EVERY_LONG_CONTEXT": "256",
