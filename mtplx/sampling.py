@@ -62,6 +62,15 @@ Distribution = np.ndarray | SparseDistribution
 
 def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     logits = np.asarray(logits, dtype=np.float64)
+    # Sanitize non-finite entries before reducing. NaN propagates through
+    # ``np.max`` and would otherwise force the ``not isfinite(total)`` branch
+    # below into a 500. Replacing NaN/Inf with -inf produces a well-defined
+    # softmax that ignores the corrupted positions while preserving relative
+    # mass on the finite logits. This matches the MLX-side guard added in
+    # ``fast_sampling.py``; both paths can be triggered at long context when
+    # the dense SDPA fallback emits non-finite trunk logits.
+    if not bool(np.all(np.isfinite(logits))):
+        logits = np.where(np.isfinite(logits), logits, -np.inf)
     if temperature <= 0:
         out = np.zeros_like(logits, dtype=np.float64)
         out[int(np.argmax(logits))] = 1.0
