@@ -98,6 +98,11 @@ SUSTAINED_PREFILL_ENV = {
     "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
     "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
     "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
+    # Aggressive context-aware ladder. The legacy threshold/cap above stays
+    # in place as a fallback when the ladder is explicitly disabled (env var
+    # set to ""). See `resolve_long_context_mtp_depth` in profiles.py and
+    # the rationale block above DEFAULT_MTP_LONG_CONTEXT_LADDER.
+    "MTPLX_MTP_LONG_CONTEXT_LADDER": "16384:2,24576:1,30720:0",
     "MTPLX_MTP_HISTORY_POLICY": "auto",
     "MTPLX_MTP_HISTORY_LAST_WINDOW": "8192",
     "MTPLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD": "16384",
@@ -128,6 +133,80 @@ def _env_int(
         return default
 
 
+# --- MTP long-context depth ladder -------------------------------------------
+#
+# Rationale: MTP draft acceptance on Qwen3-family models collapses as context
+# grows. Independent vLLM tracking issues confirm the same trend (#35387 shows
+# a 76% latency regression at 256K context; #40756 reports crashes at 26K;
+# #36872 documents acceptance dropping 61% -> 0.9% -> 0% across consecutive
+# turns). Our own MTPLX tracking issue #49 reproduces the curve at depth=3
+# (47% -> 33% -> 27%). The vLLM-recommended setting for Qwen3.6-35B is
+# `num_speculative_tokens=2`, not 3.
+#
+# Cheapest mitigation: lower the speculative depth as the prompt grows. This
+# ladder caps requested depth based on prompt token count, with a final step
+# that disables MTP entirely (depth=0) once the context exceeds the largest
+# threshold. Both the existing single-step `auto` policy and the new ladder
+# coexist - the ladder takes precedence when configured.
+#
+# Default ladder ("16384:2,24576:1,30720:0"):
+#   <16K              -> requested depth (default 3)
+#   16384 .. 24575    -> min(requested, 2)
+#   24576 .. 30719    -> min(requested, 1)
+#   >= 30720          -> 0 (MTP off)
+DEFAULT_MTP_LONG_CONTEXT_LADDER = "16384:2,24576:1,30720:0"
+
+
+def _parse_ladder(
+    raw: str | None,
+) -> tuple[tuple[int, int], ...]:
+    """Parse a comma-separated `threshold:capped_depth` ladder spec.
+
+    Returns the ladder sorted ascending by threshold. Returns an empty tuple
+    on an explicit empty string (caller treats this as "ladder disabled").
+    Malformed entries are skipped silently so a bad env var never bricks
+    the server. Negative thresholds clamp to 0; capped_depth clamps to >= 0
+    (0 means "MTP off at this rung").
+    """
+
+    if raw is None:
+        return ()
+    text = raw.strip()
+    if not text:
+        return ()
+    pairs: list[tuple[int, int]] = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            continue
+        thr_str, cap_str = chunk.split(":", 1)
+        try:
+            threshold = max(0, int(thr_str.strip()))
+            cap = max(0, int(cap_str.strip()))
+        except (TypeError, ValueError):
+            continue
+        pairs.append((threshold, cap))
+    pairs.sort(key=lambda kv: kv[0])
+    return tuple(pairs)
+
+
+def _ladder_step_for_prompt(
+    ladder: tuple[tuple[int, int], ...],
+    prompt_tokens: int,
+) -> tuple[int, int] | None:
+    """Return the highest-threshold rung whose threshold <= prompt_tokens."""
+
+    selected: tuple[int, int] | None = None
+    for threshold, cap in ladder:
+        if int(prompt_tokens) >= int(threshold):
+            selected = (threshold, cap)
+        else:
+            break
+    return selected
+
+
 def resolve_long_context_mtp_depth(
     *,
     prompt_tokens: int,
@@ -140,6 +219,10 @@ def resolve_long_context_mtp_depth(
     Depth 3 is still the default because it wins at short and mid context. On the
     M5 Max 128k path, depth 2 recovered decode while preserving exact speculative
     sampling. This helper keeps that product policy explicit and observable.
+
+    If MTPLX_MTP_LONG_CONTEXT_LADDER is set (or defaults are used and policy
+    is "auto"), a multi-step ladder takes precedence over the single-threshold
+    cap. See DEFAULT_MTP_LONG_CONTEXT_LADDER for the default schedule.
     """
 
     source = os.environ if env is None else env
@@ -159,6 +242,16 @@ def resolve_long_context_mtp_depth(
         1,
         _env_int(source, "MTPLX_LONG_CONTEXT_MTP_DEPTH", default=2),
     )
+    ladder_raw = source.get("MTPLX_MTP_LONG_CONTEXT_LADDER")
+    # If env var is unset, fall back to the default ladder. If env var is
+    # set to an empty string, treat as "ladder explicitly disabled" and
+    # only use the legacy single-step gate.
+    if ladder_raw is None:
+        ladder = _parse_ladder(DEFAULT_MTP_LONG_CONTEXT_LADDER)
+        ladder_source = "default"
+    else:
+        ladder = _parse_ladder(ladder_raw)
+        ladder_source = "env" if ladder else "env_empty"
     details: dict[str, object] = {
         "policy": policy,
         "prompt_tokens": int(prompt_tokens),
@@ -168,6 +261,8 @@ def resolve_long_context_mtp_depth(
         "min_depth": int(floor),
         "active": False,
         "reason": "disabled",
+        "ladder": [list(rung) for rung in ladder],
+        "ladder_source": ladder_source,
     }
     if policy in {"", "0", "off", "false", "none"}:
         details["effective_depth"] = int(requested)
@@ -176,6 +271,34 @@ def resolve_long_context_mtp_depth(
         details["reason"] = "unknown_policy"
         details["effective_depth"] = int(requested)
         return requested, details
+
+    # Ladder takes precedence over the single-step gate when configured.
+    rung = _ladder_step_for_prompt(ladder, int(prompt_tokens)) if ladder else None
+    if rung is not None:
+        rung_threshold, rung_cap = rung
+        # rung_cap of 0 means "MTP off at this rung". The downstream generator
+        # path requires depth >= 1, so we clamp to max(rung_cap, floor) when
+        # rung_cap > 0, and only return 0 when the caller can handle that
+        # (server.openai applies the ladder before dispatch and switches to AR).
+        if rung_cap <= 0:
+            effective = 0
+        else:
+            effective = min(requested, max(rung_cap, floor))
+        details["ladder_threshold"] = int(rung_threshold)
+        details["ladder_cap_depth"] = int(rung_cap)
+        details["effective_depth"] = int(effective)
+        if effective < requested:
+            details["active"] = True
+            details["reason"] = (
+                f"ladder_step_{rung_threshold}"
+                if rung_cap > 0
+                else f"ladder_step_{rung_threshold}_mtp_off"
+            )
+        else:
+            details["reason"] = "ladder_within_cap"
+        return effective, details
+
+    # Fall back to the legacy single-step gate.
     if int(prompt_tokens) < threshold:
         details["reason"] = "below_threshold"
         details["effective_depth"] = int(requested)

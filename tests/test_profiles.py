@@ -120,17 +120,92 @@ def test_sustained_profile_is_native_mtp_long_context_path() -> None:
     assert "MTPLX_EVAL_STATE_ROOTS_ON_COMMIT" not in profile.env_dict()
 
 
-def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
+def test_sustained_long_context_depth_ladder_steps_down() -> None:
+    """Sustained's MTP depth ladder lowers depth as prompt grows.
+
+    See `resolve_long_context_mtp_depth` and DEFAULT_MTP_LONG_CONTEXT_LADDER
+    in mtplx/profiles.py. The Sustained profile sets the ladder explicitly
+    to "16384:2,24576:1,30720:0" (rationale block in profiles.py cites
+    vLLM #35387 / #36872 / #40756 and MTPLX #49).
+    """
+
     env = SUSTAINED_PREFILL_ENV
 
+    # Below the first rung: requested depth passes through untouched.
     depth, details = resolve_long_context_mtp_depth(
-        prompt_tokens=65536,
+        prompt_tokens=8192,
         requested_depth=3,
         env=env,
     )
     assert depth == 3
     assert details["active"] is False
     assert details["reason"] == "below_threshold"
+    assert details["ladder_source"] == "env"
+
+    # 16K rung: cap at depth=2.
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=16384,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 2
+    assert details["active"] is True
+    assert details["reason"] == "ladder_step_16384"
+    assert details["ladder_threshold"] == 16384
+    assert details["ladder_cap_depth"] == 2
+    assert details["effective_depth"] == 2
+
+    # 24K rung: cap at depth=1.
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=25000,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 1
+    assert details["active"] is True
+    assert details["reason"] == "ladder_step_24576"
+    assert details["ladder_cap_depth"] == 1
+
+    # 30K rung: MTP off (depth=0).
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=40000,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 0
+    assert details["active"] is True
+    assert details["reason"] == "ladder_step_30720_mtp_off"
+    assert details["ladder_cap_depth"] == 0
+    assert details["effective_depth"] == 0
+
+    # Requested depth already below the rung cap: stays put.
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=20000,
+        requested_depth=1,
+        env=env,
+    )
+    assert depth == 1
+    assert details["active"] is False
+    assert details["reason"] == "ladder_within_cap"
+
+
+def test_long_context_depth_ladder_explicitly_disabled() -> None:
+    """Empty ladder env var falls back to legacy single-step gate."""
+
+    env = {
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD": "98304",
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH": "2",
+        "MTPLX_MTP_LONG_CONTEXT_LADDER": "",
+    }
+    depth, details = resolve_long_context_mtp_depth(
+        prompt_tokens=65536,
+        requested_depth=3,
+        env=env,
+    )
+    assert depth == 3
+    assert details["reason"] == "below_threshold"
+    assert details["ladder_source"] == "env_empty"
 
     depth, details = resolve_long_context_mtp_depth(
         prompt_tokens=131072,
@@ -138,16 +213,25 @@ def test_sustained_long_context_depth_policy_caps_only_128k_class() -> None:
         env=env,
     )
     assert depth == 2
-    assert details["active"] is True
     assert details["reason"] == "long_context_depth_cap"
-    assert details["requested_depth"] == 3
-    assert details["effective_depth"] == 2
 
-    depth, details = resolve_long_context_mtp_depth(
-        prompt_tokens=131072,
-        requested_depth=1,
-        env=env,
+
+def test_long_context_depth_ladder_custom_spec() -> None:
+    """Custom ladder spec overrides defaults."""
+
+    env = {
+        "MTPLX_LONG_CONTEXT_MTP_DEPTH_POLICY": "auto",
+        "MTPLX_MTP_LONG_CONTEXT_LADDER": "4096:2,8192:1",
+    }
+    depth, _ = resolve_long_context_mtp_depth(
+        prompt_tokens=2048, requested_depth=3, env=env
+    )
+    assert depth == 3
+    depth, _ = resolve_long_context_mtp_depth(
+        prompt_tokens=5000, requested_depth=3, env=env
+    )
+    assert depth == 2
+    depth, _ = resolve_long_context_mtp_depth(
+        prompt_tokens=20000, requested_depth=3, env=env
     )
     assert depth == 1
-    assert details["active"] is False
-    assert details["reason"] == "already_within_cap"

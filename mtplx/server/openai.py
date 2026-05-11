@@ -55,6 +55,7 @@ from mtplx.profiles import (
     apply_profile_env,
     get_profile,
     profile_env_status,
+    resolve_long_context_mtp_depth,
 )
 from mtplx.draft_lm_head import _install_draft_lm_head
 from mtplx.server_urls import bind_label, is_wildcard_bind, local_url_for_bind
@@ -2358,6 +2359,52 @@ def _request_depth_for_generation(
     return depth
 
 
+def _apply_long_context_ladder(
+    *,
+    prompt_tokens: int,
+    requested_depth: int,
+    generation_mode: str,
+) -> tuple[int, str, dict[str, Any]]:
+    """Apply the context-length-based MTP depth ladder at request time.
+
+    Returns ``(effective_depth, effective_generation_mode, details)``. When the
+    ladder's selected rung specifies a capped depth of 0 (MTP off), the mode
+    is switched to ``"ar"`` and the returned depth is 0 so the downstream AR
+    path can run safely. The details dict is shaped the same as the one
+    produced by :func:`resolve_long_context_mtp_depth` for the in-generation
+    gate, so it can be surfaced as ``long_context_mtp_depth_policy`` in the
+    request metrics envelope.
+
+    This is the FIRST layer of the gate: the request-time ladder. The
+    in-generation single-step gate inside ``generate_mtpk`` (also using
+    ``resolve_long_context_mtp_depth``) is the SECOND layer and still runs.
+    Both layers are safe to stack because the second layer can only further
+    reduce depth, not increase it.
+
+    See ``mtplx.profiles.DEFAULT_MTP_LONG_CONTEXT_LADDER`` for the default
+    schedule and the rationale (vLLM #35387 / #36872 / #40756, MTPLX #49).
+    """
+
+    if generation_mode != "mtp":
+        return int(requested_depth), generation_mode, {}
+    effective, details = resolve_long_context_mtp_depth(
+        prompt_tokens=int(prompt_tokens),
+        requested_depth=max(1, int(requested_depth)),
+    )
+    effective_mode = generation_mode
+    if effective <= 0:
+        # Ladder asked for MTP off at this context size. The downstream
+        # generator requires depth >= 1 in mtp mode, so we switch the request
+        # to AR. The metrics envelope still records the ladder details so
+        # observers can see why the mode flipped.
+        effective_mode = "ar"
+        effective = 0
+        details["mode_switched_to_ar"] = True
+    else:
+        details["mode_switched_to_ar"] = False
+    return int(effective), effective_mode, details
+
+
 def _token_window_rate(token_times: list[float], window: int) -> float | None:
     if len(token_times) < 2:
         return None
@@ -2716,6 +2763,7 @@ def _request_observability(
     session_source: str | None,
     request_generation_mode: str,
     request_depth: int,
+    long_context_ladder_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     user_texts = [
         _content_to_text(message.content)
@@ -2749,6 +2797,7 @@ def _request_observability(
         "request_depth": int(request_depth),
         "request_last_user_preview": user_texts[-1][:180] if user_texts else None,
         "request_last_user_chars": len(user_texts[-1]) if user_texts else 0,
+        "request_long_context_ladder": dict(long_context_ladder_details or {}),
     }
 
 
@@ -3731,15 +3780,38 @@ def _run_generation(
         envelope["requested_mtp_depth"] = (
             requested_mtp_depth if effective_mode == "mtp" else 0
         )
-        envelope["long_context_mtp_depth_policy"] = (
+        # Surface the request-time ladder (computed in _apply_long_context_ladder)
+        # whenever it was set, even if generation ran in AR mode because the
+        # ladder forced MTP off. The in-generation gate writes its own copy
+        # of `long_context_mtp_depth_policy` into stats only when MTP runs and
+        # the gate triggers; the request-time ladder runs unconditionally and
+        # is the more informative one for chat-monitor.
+        in_generation_policy = (
             (stats.get("long_context_mtp_depth_policy") or {})
             if effective_mode == "mtp"
             else {}
         )
+        ladder_details_from_request = (
+            (request_observability or {}).get("request_long_context_ladder")
+            or {}
+        )
+        if ladder_details_from_request:
+            merged_policy: dict[str, Any] = dict(ladder_details_from_request)
+            # If the in-generation gate also added details, let them override
+            # (they have the most accurate post-resolution view).
+            if in_generation_policy:
+                merged_policy.update(in_generation_policy)
+            envelope["long_context_mtp_depth_policy"] = merged_policy
+        else:
+            envelope["long_context_mtp_depth_policy"] = in_generation_policy
         if effective_mode == "ar":
             envelope["mtp_depth"] = 0
             envelope["requested_mtp_depth"] = 0
-            envelope["long_context_mtp_depth_policy"] = {}
+            # Keep the ladder policy visible even in AR mode when the ladder
+            # is the reason MTP got disabled - clearing it here would hide
+            # the "why" from observers.
+            if not ladder_details_from_request:
+                envelope["long_context_mtp_depth_policy"] = {}
             envelope["verify_calls"] = 0
             envelope["verify_time_s"] = 0.0
             envelope["accepted_by_depth"] = []
@@ -5815,6 +5887,9 @@ def create_app(state: ServerState) -> FastAPI:
                 "MTPLX_LONG_CONTEXT_MTP_DEPTH_THRESHOLD"
             ),
             "long_context_mtp_depth": os.environ.get("MTPLX_LONG_CONTEXT_MTP_DEPTH"),
+            "mtp_long_context_ladder": os.environ.get(
+                "MTPLX_MTP_LONG_CONTEXT_LADDER"
+            ),
             "mtp_position_mode": os.environ.get("MTPLX_MTP_POSITION_MODE"),
             "mtp_position_cap": os.environ.get("MTPLX_MTP_POSITION_CAP"),
             "mtp_position_period": os.environ.get("MTPLX_MTP_POSITION_PERIOD"),
@@ -6038,6 +6113,13 @@ def create_app(state: ServerState) -> FastAPI:
             strip_assistant_reasoning_history=state.args.strip_assistant_reasoning_history,
             tools=tool_specs if tools_active else None,
         )
+        request_depth, request_generation_mode, long_context_ladder_details = (
+            _apply_long_context_ladder(
+                prompt_tokens=len(prompt_ids),
+                requested_depth=request_depth,
+                generation_mode=request_generation_mode,
+            )
+        )
         current_system_hash = system_prompt_hash(request.messages)
         if current_system_hash is not None and not background:
             state.main_system_prompt_hash = current_system_hash
@@ -6082,6 +6164,7 @@ def create_app(state: ServerState) -> FastAPI:
             session_source=session_source,
             request_generation_mode=request_generation_mode,
             request_depth=request_depth,
+            long_context_ladder_details=long_context_ladder_details,
         )
         prefix_diagnostic = getattr(state.sessions, "last_prefix_diagnostic", None)
         if isinstance(prefix_diagnostic, dict):
@@ -7016,6 +7099,11 @@ def create_app(state: ServerState) -> FastAPI:
         request_depth = _request_depth_for_generation(
             state,
             request,
+            generation_mode=request_generation_mode,
+        )
+        request_depth, request_generation_mode, _ = _apply_long_context_ladder(
+            prompt_tokens=len(prompt_ids),
+            requested_depth=request_depth,
             generation_mode=request_generation_mode,
         )
         generated = await asyncio.wrap_future(
