@@ -6453,35 +6453,36 @@ def create_app(state: ServerState) -> FastAPI:
                     return chunks
 
                 def streamed_history_content() -> str:
-                    # Always capture the natural-language portion of the
-                    # response. Previously this returned "" whenever
-                    # tool_stream.has_tool_calls, which dropped any preamble
-                    # text (e.g. "Let me check..." before <tool_call>) from
-                    # the stored assistant_content. The next turn's lookup
-                    # encodes the same assistant message WITH the preamble
-                    # (clients echo back content + tool_calls), so the
-                    # prefix diverged and every tool-using turn paid a cold
-                    # prefill. tool_call markup itself is captured in
-                    # tool_stream and not in history_content_chunks, so
-                    # this is safe to return for the tool-call case too.
-                    reasoning = (
-                        "".join(history_reasoning_chunks)
-                        .replace(THINK_OPEN, "")
-                        .replace(THINK_CLOSE, "")
-                        .strip()
-                    )
-                    content = (
+                    # The bank commit's assistant_content must match what the
+                    # client actually received and will echo back on the next
+                    # turn, otherwise the committed tokens are not a prefix
+                    # of the next request and the cache always misses.
+                    #
+                    # With the reasoning parser active (qwen3 etc.), the SSE
+                    # stream is split into `delta.content` (what most clients
+                    # read into their stored assistant message) and a
+                    # separate `delta.reasoning_content` (a special field
+                    # that the OpenAI-style schema does not require clients
+                    # to round-trip). Clients like hip and opencode store
+                    # only `content`. Their next-turn assistant message
+                    # therefore re-renders with an EMPTY <think></think>
+                    # block. If we bake the real reasoning into the bank
+                    # commit, the commit tokens diverge from every
+                    # subsequent request and every long-lived session
+                    # cache-misses at the assistant boundary.
+                    #
+                    # Commit only `history_content_chunks` to match what the
+                    # client stored. Preamble text and tool_call preambles
+                    # are in history_content_chunks (tool_call markup is
+                    # captured separately in tool_stream), so this still
+                    # preserves the preamble-fix this function was added
+                    # to address.
+                    return (
                         "".join(history_content_chunks)
                         .replace(THINK_OPEN, "")
                         .replace(THINK_CLOSE, "")
                         .strip()
                     )
-                    pieces: list[str] = []
-                    if reasoning:
-                        pieces.append(f"{THINK_OPEN}\n{reasoning}\n{THINK_CLOSE}")
-                    if content:
-                        pieces.append(content)
-                    return "\n\n".join(pieces)
 
                 for field, text in splitter.start():
                     if text:
