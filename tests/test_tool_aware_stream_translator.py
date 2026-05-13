@@ -283,6 +283,63 @@ def test_consecutive_qwen_xml_tool_call_close_split_does_not_leak_tail():
     assert len(t.tool_calls) == 2
 
 
+def test_qwen_xml_three_tool_calls_streamed_5char_chunks_no_leak():
+    """Regression for an in-the-wild Qwen3.6-27B output we saw downstream
+    (hippo-code CLI session, 2026-05-13): the model emitted three consecutive
+    `<tool_call>` blocks of the SAME tool with newlines between them, and the
+    stream arrived from MTPLX in small (~5-char) chunks. With the v0.3.3
+    parser, only the first call dispatched and the remaining two leaked as
+    `delta.content` (visible to users as raw `<tool_call><function=list>...`
+    XML in the chat display, prefixed with a truncated `_call>` fragment).
+
+    The v0.3.4 fix (commit 9e3b929) addressed it, but the existing
+    `test_consecutive_qwen_xml_tool_calls_do_not_leak_as_content` feeds the
+    whole text as one chunk. This locks in the actual streaming shape from
+    real-world traffic - three blocks, 5-char chunks, blank lines between -
+    so any future regression in the incremental parser is caught immediately.
+    """
+    t = _make()
+    text = (
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/scene\n</parameter>\n</function>\n</tool_call>\n\n"
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/entities\n</parameter>\n</function>\n</tool_call>\n"
+        "<tool_call>\n<function=lookup>\n<parameter=q>\n"
+        "src/systems\n</parameter>\n</function>\n</tool_call>"
+    )
+    out = []
+    for i in range(0, len(text), 5):
+        out.extend(t.feed("content", text[i : i + 5]))
+    out.extend(t.finish())
+
+    content = "".join(d.get("content", "") for d in out)
+    assert "<tool_call" not in content, (
+        f"tool_call markup leaked as content: {content!r}"
+    )
+    assert "_call>" not in content, (
+        f"partial-marker fragment leaked as content: {content!r}"
+    )
+    assert t.tool_calls is not None
+    assert len(t.tool_calls) == 3, (
+        f"expected 3 tool_calls, got {len(t.tool_calls)}"
+    )
+    args = [json.loads(call["function"]["arguments"]) for call in t.tool_calls]
+    assert args == [
+        {"q": "src/scene"},
+        {"q": "src/entities"},
+        {"q": "src/systems"},
+    ]
+    indices = [
+        item.get("index")
+        for delta in out
+        for item in delta.get("tool_calls", [])
+        if item.get("function", {}).get("name") == "lookup"
+    ]
+    assert indices == [0, 1, 2], (
+        f"expected ordered indices [0,1,2], got {indices}"
+    )
+
+
 def test_existing_json_tool_call_final_parse_still_works():
     t = _make()
     text = '<tool_call>{"name":"lookup","arguments":{"q":"hello"}}</tool_call>'
