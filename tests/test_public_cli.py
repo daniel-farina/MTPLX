@@ -444,6 +444,8 @@ def test_start_target_aliases_route_correctly(monkeypatch, tmp_path, capsys):
     assert run("opencode")["target"] == "opencode"
     assert run("open-code")["target"] == "opencode"
     assert run("oc")["target"] == "opencode"
+    assert run("swival")["target"] == "swival"
+    assert run("sv")["target"] == "swival"
 
 
 def test_start_opencode_dry_run_json_writes_no_hidden_cap(monkeypatch, tmp_path, capsys):
@@ -470,6 +472,39 @@ def test_start_opencode_dry_run_json_writes_no_hidden_cap(monkeypatch, tmp_path,
     assert payload["opencode"]["no_hidden_max_tokens"] is True
     assert "maxTokens" not in json.dumps(payload["opencode"]["config"])
     assert payload["opencode"]["provider"]["models"]
+
+
+def test_start_swival_dry_run_json_emits_generic_provider_command(
+    monkeypatch,
+    tmp_path,
+    capsys,
+):
+    monkeypatch.setenv("MTPLX_CONFIG", str(tmp_path / "missing-config.toml"))
+
+    code = main(
+        [
+            "start",
+            "swival",
+            "--dry-run",
+            "--json",
+            "--model",
+            "models/example",
+            "--yes",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["target"] == "swival"
+    assert payload["swival"]["base_url"] == "http://127.0.0.1:18084"
+    assert payload["swival"]["api_base_url"] == "http://127.0.0.1:18084/v1"
+    assert payload["swival"]["no_hidden_max_tokens"] is True
+    argv = payload["swival"]["command_argv"]
+    assert argv[:3] == ["swival", "--provider", "generic"]
+    assert "--base-url" in argv
+    assert "http://127.0.0.1:18084" in argv
+    assert "--max-context-tokens" in argv
+    assert "maxTokens" not in json.dumps(payload["swival"])
 
 
 def test_terminal_quickstart_max_uses_verified_max_session(monkeypatch):
@@ -1098,6 +1133,8 @@ def test_quickstart_pi_dry_run_json(monkeypatch, tmp_path, capsys):
     assert payload["pi"]["provider"]["compat"]["supportsDeveloperRole"] is False
     assert payload["pi"]["provider"]["compat"]["supportsReasoningEffort"] is False
     assert payload["pi"]["provider"]["compat"]["maxTokensField"] == "max_tokens"
+    assert payload["pi"]["no_hidden_max_tokens"] is True
+    assert "maxTokens" not in json.dumps(payload["pi"]["provider"]["models"])
     assert "--api-key mtplx-local" in payload["pi"]["server_command"]
 
 
@@ -1158,6 +1195,8 @@ def test_pi_models_config_merge_preserves_other_providers(tmp_path):
     assert payload["providers"]["other"]["models"][0]["id"] == "other-model"
     assert payload["providers"]["mtplx"]["baseUrl"] == "http://127.0.0.1:18012/v1"
     assert payload["providers"]["mtplx"]["models"][0]["id"] == "mtplx-test-model"
+    assert "maxTokens" not in payload["providers"]["mtplx"]["models"][0]
+    assert result["no_hidden_max_tokens"] is True
 
 
 def test_start_pi_handoff_writes_config_and_starts_authenticated_server(
@@ -1714,6 +1753,7 @@ def test_product_helper_commands_parse():
     )
     start_openwebui = parser.parse_args(["start", "openwebui", "--port", "18012"])
     start_opencode = parser.parse_args(["start", "opencode", "--port", "18083"])
+    start_swival = parser.parse_args(["start", "swival", "--port", "18084"])
     start_openwebui_strict = parser.parse_args(["start", "openwebui", "--strict-fast-path"])
     quickstart = parser.parse_args(["quickstart", "--port", "18012"])
     quickstart_alias = parser.parse_args(["quick-start", "--port", "18013"])
@@ -1724,8 +1764,10 @@ def test_product_helper_commands_parse():
     serve_start = parser.parse_args(["serve", "--port", "18012"])
     status = parser.parse_args(["status", "--deep"])
     doctor_opencode = parser.parse_args(["doctor", "opencode", "--json"])
+    doctor_android = parser.parse_args(["doctor", "android-studio", "--port", "8008", "--json"])
     connect = parser.parse_args(["connect", "openwebui", "--port", "18012"])
     connect_opencode = parser.parse_args(["connect", "opencode", "--port", "18012"])
+    connect_swival = parser.parse_args(["connect", "swival", "--port", "18084"])
     models = parser.parse_args(["models", "--json"])
     report = parser.parse_args(["report", "--output-dir", "reports"])
     nightly = parser.parse_args(["bench", "nightly", "--out", "out.json"])
@@ -1737,6 +1779,7 @@ def test_product_helper_commands_parse():
     openwebui_docker = parser.parse_args(["openwebui", "docker-command", "--mtplx-port", "18012"])
     claude = parser.parse_args(["integrate", "claude-code", "--port", "18012"])
     opencode = parser.parse_args(["integrate", "opencode", "--port", "18012"])
+    swival = parser.parse_args(["integrate", "swival", "--port", "18084"])
     architectures = parser.parse_args(["model", "architectures", "--json"])
     qa_architectures = parser.parse_args(["model", "qa-architectures", "--json"])
     publish = parser.parse_args(["model", "publish-check", "--repo-id", "mtplx/example"])
@@ -1751,6 +1794,8 @@ def test_product_helper_commands_parse():
     assert start_openwebui.port == 18012
     assert start_opencode.target == "opencode"
     assert start_opencode.port == 18083
+    assert start_swival.target == "swival"
+    assert start_swival.port == 18084
     assert start_openwebui.strict_fast_path is False
     assert start_openwebui_strict.strict_fast_path is True
     assert quickstart.command == "quickstart"
@@ -1774,9 +1819,13 @@ def test_product_helper_commands_parse():
     assert status.deep is True
     assert doctor_opencode.command == "doctor"
     assert doctor_opencode.topic == "opencode"
+    assert doctor_android.command == "doctor"
+    assert doctor_android.topic == "android-studio"
+    assert doctor_android.port == 8008
     assert connect.command == "connect"
     assert connect.integration == "openwebui"
     assert connect_opencode.integration == "opencode"
+    assert connect_swival.integration == "swival"
     assert models.command == "models"
     assert report.command == "report"
     assert report.bundle is True
@@ -1792,6 +1841,7 @@ def test_product_helper_commands_parse():
     assert openwebui_docker.mtplx_port == 18012
     assert claude.integration == "claude-code"
     assert opencode.integration == "opencode"
+    assert swival.integration == "swival"
     assert architectures.model_action == "architectures"
     assert qa_architectures.model_action == "qa-architectures"
     assert publish.model_action == "publish-check"
@@ -1858,6 +1908,71 @@ def test_integrate_opencode_json_uses_raw_reasoning_contract(capsys):
     assert model["interleaved"] == {"field": "reasoning_content"}
     assert model["options"]["enable_thinking"] is True
     assert "reasoningSummary" not in model["options"]
+
+
+def test_integrate_swival_json_emits_generic_provider_command(capsys):
+    code = main(
+        [
+            "integrate",
+            "swival",
+            "--port",
+            "18084",
+            "--context-window",
+            "131072",
+            "--json",
+        ]
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    assert payload["integration"] == "swival"
+    assert payload["base_url"] == "http://127.0.0.1:18084"
+    assert payload["api_base_url"] == "http://127.0.0.1:18084/v1"
+    assert payload["context_window"] == 131072
+    assert payload["command_argv"] == [
+        "swival",
+        "--provider",
+        "generic",
+        "--base-url",
+        "http://127.0.0.1:18084",
+        "--model",
+        payload["model_id"],
+        "--max-context-tokens",
+        "131072",
+    ]
+    assert "maxTokens" not in json.dumps(payload)
+
+
+def test_doctor_android_studio_json_reports_openai_compatibility(monkeypatch, capsys):
+    monkeypatch.setattr(
+        public,
+        "_http_json",
+        lambda url, timeout=15.0: {
+            "object": "list",
+            "data": [{"id": "mtplx-qwen36-27b-optimized-speed"}],
+        },
+    )
+    monkeypatch.setattr(
+        public,
+        "_http_post_json",
+        lambda url, payload, timeout=15.0: {"ok": True, "status": 200, "json": {}},
+    )
+    monkeypatch.setattr(
+        public,
+        "_http_post_text",
+        lambda url, payload, timeout=15.0: {"ok": True, "status": 200, "preview": "data: [DONE]"},
+    )
+
+    code = main(["doctor", "android-studio", "--port", "8008", "--json"])
+
+    payload = json.loads(capsys.readouterr().out)
+    assert code == 0
+    android = payload["android_studio"]
+    assert android["paste_url"] == "http://127.0.0.1:8008/v1"
+    assert android["url_schema"] == "OpenAI-compatible"
+    assert android["model"] == "mtplx-qwen36-27b-optimized-speed"
+    assert android["chat_nonstream"]["ok"] is True
+    assert android["chat_stream"]["ok"] is True
 
 
 def test_config_set_dry_run_uses_selected_path(tmp_path, capsys):
